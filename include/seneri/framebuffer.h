@@ -88,6 +88,18 @@ enum framebuffer_status framebuffer_read_pixel(
 );
 enum framebuffer_status framebuffer_fill(uint32_t pixel);
 
+/*
+ * Move the image up by rows pixels and fill the band this exposes at the
+ * bottom. Asking to scroll by the whole height or more is a fill, not a
+ * refusal, because that is what it means.
+ *
+ * This exists as a framebuffer operation rather than a loop in the console
+ * because it is the one place the kernel reads the framebuffer in bulk. The
+ * window is uncacheable, so every source pixel is a bus cycle, and doing it
+ * here keeps the single hot loop next to the pitch arithmetic it depends on.
+ */
+enum framebuffer_status framebuffer_scroll_up(uint32_t rows, uint32_t fill);
+
 struct framebuffer_state framebuffer_get_state(void);
 enum framebuffer_status framebuffer_verify(void);
 bool framebuffer_self_test(void);

@@ -8,7 +8,7 @@ SERIAL_LOG := $(BUILD_DIR)/serial.log
 TEST_BUILD_DIR := $(BUILD_DIR)/tests
 TEST_SCENARIOS := normal breakpoint invalid-opcode page-fault ist pit unexpected \
 	double-fault apic ioapic retired apic-timer tsc pm-timer pit-retired timers \
-	paging heap pci pci-ecam threads thread-guard framebuffer
+	paging heap pci pci-ecam threads thread-guard framebuffer screen
 TEST_TARGETS := $(addprefix qemu-test-,$(TEST_SCENARIOS))
 
 CC := gcc
@@ -26,6 +26,8 @@ RUST_SOURCES := $(wildcard src/rust/*.rs)
 LOGO_SOURCE := assets/seneri-logo.png
 LOGO_BLOB := $(BUILD_DIR)/logo.srl
 LOGO_SIZE := 256
+FONT_SOURCE := tools/font8x16.txt
+FONT_BLOB := $(BUILD_DIR)/font.snf
 
 CPPFLAGS := -Iinclude
 COMMON_FLAGS := -m64 -g -ffreestanding -fno-pie -fno-stack-protector
@@ -80,8 +82,15 @@ $(BUILD_DIR)/%.o: src/kernel/%.c | $(BUILD_DIR)
 $(LOGO_BLOB): $(LOGO_SOURCE) tools/make-logo-asset.py | $(BUILD_DIR)
 	$(PYTHON) tools/make-logo-asset.py $(LOGO_SOURCE) $(LOGO_SIZE) $@
 
-$(RUST_LIB): $(RUST_SOURCES) $(LOGO_BLOB) | $(BUILD_DIR)
+# Regenerated only when the glyph art changes. Also a build artifact; the
+# committed source is the ASCII art in $(FONT_SOURCE), so a clone needs nothing
+# but Python to build the kernel.
+$(FONT_BLOB): $(FONT_SOURCE) tools/make-font-asset.py | $(BUILD_DIR)
+	$(PYTHON) tools/make-font-asset.py $(FONT_SOURCE) $@
+
+$(RUST_LIB): $(RUST_SOURCES) $(LOGO_BLOB) $(FONT_BLOB) | $(BUILD_DIR)
 	SENERI_LOGO_BLOB='$(CURDIR)/$(LOGO_BLOB)' \
+	SENERI_FONT_BLOB='$(CURDIR)/$(FONT_BLOB)' \
 		$(RUSTC) $(RUSTFLAGS) -o $@ src/rust/lib.rs
 
 $(KERNEL): $(OBJECTS) $(RUST_LIB) linker.ld
@@ -128,6 +137,8 @@ verify: toolchain lint
 	# linked as ordinary code rather than as something with its own runtime.
 	@$(NM) $(KERNEL) | grep -Eq ' T seneri_logo_decode$$'
 	@$(NM) $(KERNEL) | grep -Eq ' T seneri_logo_self_test$$'
+	@$(NM) $(KERNEL) | grep -Eq ' T seneri_font_glyph$$'
+	@$(NM) $(KERNEL) | grep -Eq ' T seneri_font_self_test$$'
 
 $(ISO): $(KERNEL) grub/grub.cfg
 	mkdir -p $(ISO_ROOT)/boot/grub
@@ -178,6 +189,7 @@ qemu-test-%: $(TEST_BUILD_DIR)/%/seneri.iso
 		threads) expected=75 ;; \
 		thread-guard) expected=77 ;; \
 		framebuffer) expected=79 ;; \
+		screen) expected=81 ;; \
 		*) echo 'unknown QEMU scenario: $*'; exit 1 ;; \
 	esac; \
 	# Only pci-ecam departs from the default machine. i440fx publishes no \
@@ -258,6 +270,10 @@ qemu-test-%: $(TEST_BUILD_DIR)/%/seneri.iso
 		  ! grep -Eq '^Seneri OS: framebuffer [0-9]+x[0-9]+ at 0x[0-9A-F]+ pitch [0-9]+ RGB [0-9]+/[0-9]+/[0-9]+$$' "$$log" || \
 		  ! grep -Fxq 'Seneri OS: framebuffer verified 786432 pixels' "$$log" || \
 		  ! grep -Fq 'Seneri OS: framebuffer established' "$$log" || \
+		  ! grep -Eq '^Seneri OS: screen console [0-9]+x[0-9]+ cells of 8x16, font [0-9]+ bytes$$' "$$log" || \
+		  ! grep -Eq '^Seneri OS: screen console drew [0-9]+ characters and scrolled [0-9]+ times$$' "$$log" || \
+		  ! grep -Fq 'Seneri OS: screen console established' "$$log" || \
+		  ! grep -Fq 'Seneri OS: screen console passed' "$$log" || \
 		  ! grep -Fq 'Seneri OS: never triple fault milestone passed' "$$log"; }; then \
 		echo 'normal scenario did not complete the integrated production path'; \
 		cat "$$log"; \

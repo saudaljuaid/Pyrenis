@@ -195,6 +195,50 @@ enum framebuffer_status framebuffer_fill(uint32_t pixel)
     return FRAMEBUFFER_STATUS_OK;
 }
 
+enum framebuffer_status framebuffer_scroll_up(uint32_t rows, uint32_t fill)
+{
+    if (!state.active) {
+        return FRAMEBUFFER_STATUS_NOT_INITIALIZED;
+    }
+
+    if (rows == 0U) {
+        return FRAMEBUFFER_STATUS_OK;
+    }
+
+    /*
+     * Scrolling by the whole screen or more leaves nothing to move. Clearing
+     * is the correct answer rather than a refusal: a caller asking to discard
+     * every row has asked for a blank screen, and answering with an error
+     * would make the console's own edge case its caller's problem.
+     */
+    if (rows >= state.height) {
+        return framebuffer_fill(fill);
+    }
+
+    /*
+     * Upward, front to back. The destination row is always above the source,
+     * so a forward walk never reads a row this loop has already overwritten.
+     */
+    for (uint32_t y = 0; y + rows < state.height; ++y) {
+        volatile uint32_t *destination = pixel_at(0U, y);
+        const volatile uint32_t *source = pixel_at(0U, y + rows);
+
+        for (uint32_t x = 0; x < state.width; ++x) {
+            destination[x] = source[x];
+        }
+    }
+
+    for (uint32_t y = state.height - rows; y < state.height; ++y) {
+        volatile uint32_t *row = pixel_at(0U, y);
+
+        for (uint32_t x = 0; x < state.width; ++x) {
+            row[x] = fill;
+        }
+    }
+
+    return FRAMEBUFFER_STATUS_OK;
+}
+
 struct framebuffer_state framebuffer_get_state(void)
 {
     return state;

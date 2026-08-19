@@ -98,7 +98,10 @@ long you will be in there.
 
 | File | | |
 | --- | ---: | --- |
-| `framebuffer.c` | 420 | The linear framebuffer, validated field by field, mapped uncached. |
+| `framebuffer.c` | 460 | The linear framebuffer, validated field by field, mapped uncached. |
+| `screen.c` | 525 | Text on the framebuffer: cells, wrapping, scrolling, and reading it back. |
+| `font.c` | 39 | The C side of the font: names for what the reader can refuse. |
+| `rust/font.rs` | 276 | The glyph table reader. Rust, on the first hot path in this kernel. |
 | `logo.c` | 39 | The C side of the logo: three lines of glue. |
 | `rust/logo.rs` | 330 | The decoder. Rust, because it parses bytes the kernel did not produce. |
 | `rust/abi.rs`, `rust/lib.rs` | 103 + 42 | What the two languages promise each other. |
@@ -143,7 +146,8 @@ it happens.
     prove_threads                 more than one thread of control
     prove_preemption              threads that never yield still lose the CPU
     prove_framebuffer             every one of 786,432 pixels
-    draw_logo
+    draw_logo                     the splash
+    prove_screen_console          text on the screen, read back off the glass
     paging_verify                 re-walk the tables at the end, not the middle
     heap_verify
     pci_verify

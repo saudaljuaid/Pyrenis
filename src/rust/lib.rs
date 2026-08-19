@@ -21,6 +21,7 @@
 #![deny(missing_docs)]
 
 pub mod abi;
+pub mod font;
 pub mod logo;
 
 /// Where a Rust panic goes.

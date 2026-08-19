@@ -27,6 +27,7 @@
 #include <seneri/framebuffer.h>
 #include <seneri/heap.h>
 #include <seneri/interrupts.h>
+#include <seneri/font.h>
 #include <seneri/logo.h>
 #include <seneri/ioapic.h>
 #include <seneri/memory.h>
@@ -35,6 +36,7 @@
 #include <seneri/pic.h>
 #include <seneri/pit.h>
 #include <seneri/pm_timer.h>
+#include <seneri/screen.h>
 #include <seneri/self_test.h>
 #include <seneri/test.h>
 #include <seneri/thread.h>
@@ -160,12 +162,20 @@ _Noreturn void kernel_main(uint32_t magic, uintptr_t boot_information)
         console_panic("framebuffer geometry self-test failed");
     }
 
+    if (!screen_self_test()) {
+        console_panic("screen console grid self-test failed");
+    }
+
     /*
      * The first self-test in this kernel that is not C. It runs beside the
      * others because a caller should not have to care which language answered.
      */
     if (seneri_logo_self_test() != 1) {
         console_panic("logo decoder self-test failed");
+    }
+
+    if (seneri_font_self_test() != 1) {
+        console_panic("font reader self-test failed");
     }
 
     console_write("Seneri OS: parser rejection tests passed\n");
@@ -280,6 +290,25 @@ _Noreturn void kernel_main(uint32_t magic, uintptr_t boot_information)
     bring_up_heap();
     prove_heap_lifecycle();
 
+    /*
+     * As early as the address space allows, which is here: the framebuffer is a
+     * device window paging carved out above, so this cannot run before
+     * install_page_tables, and everything after this line appears on the screen
+     * as well as on the serial port.
+     *
+     * The logo is drawn first and the console then replaces it. That ordering
+     * is the whole argument for putting this here rather than at the end of
+     * boot: a splash nobody can read is worth less than the log, and a log that
+     * only starts once boot has finished has missed the part somebody watching
+     * a machine that will not start actually needs.
+     */
+    prove_framebuffer(&context.framebuffer);
+
+    if (framebuffer_is_active()) {
+        draw_logo();
+        prove_screen_console();
+    }
+
     console_write("Seneri OS: day one passed\n");
     console_write("Seneri OS: memory foundation passed\n");
     test_scenario = kernel_test_select(&context);
@@ -318,11 +347,6 @@ _Noreturn void kernel_main(uint32_t magic, uintptr_t boot_information)
     bring_up_pci(boot_mcfg_present ? &boot_mcfg : NULL, boot_mcfg_present);
     prove_threads();
     prove_preemption();
-    prove_framebuffer(&context.framebuffer);
-
-    if (framebuffer_is_active()) {
-        draw_logo();
-    }
 
     /*
      * Re-walk the installed hierarchy at the end of boot. Everything between
@@ -389,6 +413,7 @@ _Noreturn void kernel_main(uint32_t magic, uintptr_t boot_information)
     console_write("Seneri OS: preemption passed\n");
     console_write("Seneri OS: framebuffer passed\n");
     console_write("Seneri OS: logo passed\n");
+    console_write("Seneri OS: screen console passed\n");
     console_write("Seneri OS: never triple fault milestone passed\n");
 
     if (test_scenario == KERNEL_TEST_NORMAL) {

@@ -92,4 +92,11 @@ void prove_preemption(void);
 void prove_framebuffer(const struct boot_framebuffer *framebuffer);
 void draw_logo(void);
 
+/*
+ * Runs after the logo rather than before it. The logo is a splash and the
+ * console replaces it, so the last thing on the screen at the end of boot is
+ * the boot log rather than a picture.
+ */
+void prove_screen_console(void);
+
 #endif

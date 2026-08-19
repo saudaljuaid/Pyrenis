@@ -29,6 +29,7 @@
 #include <seneri/console.h>
 #include <seneri/cpu.h>
 #include <seneri/framebuffer.h>
+#include <seneri/font.h>
 #include <seneri/heap.h>
 #include <seneri/interrupts.h>
 #include <seneri/logo.h>
@@ -39,6 +40,7 @@
 #include <seneri/pic.h>
 #include <seneri/pit.h>
 #include <seneri/pm_timer.h>
+#include <seneri/screen.h>
 #include <seneri/self_test.h>
 #include <seneri/test.h>
 #include <seneri/thread.h>
@@ -1645,4 +1647,183 @@ void prove_frame_lifecycle(void)
     if (frame_release(0U) != FRAME_STATUS_FRAME_NOT_ALLOCATABLE) {
         console_panic("frame allocator released permanently reserved memory");
     }
+}
+
+/*
+ * Text on the framebuffer, and proof that it is really there.
+ *
+ * Everything else this console does is a write into device memory, and a write
+ * nothing reads back proves nothing: the pattern could be off by a row, the
+ * glyph could be mirrored, the foreground and background could be swapped, and
+ * every one of those draws something. So the proof reads the pixels back and
+ * compares them against what the font says they should be, cell by cell.
+ *
+ * It runs after the logo on purpose. The logo is a splash and this replaces it,
+ * so the last thing on the screen at the end of boot is the boot log - which is
+ * the thing somebody standing in front of the machine actually needs.
+ */
+void prove_screen_console(void)
+{
+    static const char sample[] = "Seneri OS";
+    static const size_t sample_length = sizeof(sample) - 1U;
+
+    struct screen_state before;
+    struct screen_state after;
+    enum screen_status status;
+
+    status = screen_initialize();
+
+    if (status != SCREEN_STATUS_OK) {
+        console_panic(screen_status_string(status));
+    }
+
+    before = screen_get_state();
+
+    console_write("Seneri OS: screen console ");
+    console_write_u64(before.columns);
+    console_write("x");
+    console_write_u64(before.rows);
+    console_write(" cells of ");
+    console_write_u64(before.cell_width);
+    console_write("x");
+    console_write_u64(before.cell_height);
+    console_write(", font ");
+    console_write_u64(seneri_font_size());
+    console_write(" bytes\n");
+
+    /*
+     * From a known screen, so the cells checked below hold what this proof put
+     * in them rather than whatever the transcript had reached.
+     */
+    status = screen_clear();
+
+    if (status != SCREEN_STATUS_OK) {
+        console_panic(screen_status_string(status));
+    }
+
+    status = screen_write(sample);
+
+    if (status != SCREEN_STATUS_OK) {
+        console_panic(screen_status_string(status));
+    }
+
+    for (size_t index = 0; index < sample_length; ++index) {
+        if (screen_verify_cell((uint32_t)index, 0U, sample[index]) !=
+            SCREEN_STATUS_OK) {
+            console_panic("screen console does not match the font it drew from");
+        }
+    }
+
+    /*
+     * A cell the sample never wrote to must be background, not a leftover. This
+     * is what catches a draw that is one cell wide when it should be eight, or
+     * a clear that did not.
+     */
+    if (screen_verify_cell((uint32_t)sample_length + 1U, 0U, ' ') !=
+        SCREEN_STATUS_OK) {
+        console_panic("screen console left something in a cell it never drew");
+    }
+
+    /*
+     * A byte the font does not cover is substituted rather than refused. A
+     * console that stops on an unexpected character eventually swallows the
+     * message explaining what went wrong.
+     */
+    status = screen_putc('\x01');
+
+    if (status != SCREEN_STATUS_OK) {
+        console_panic(screen_status_string(status));
+    }
+
+    if (screen_verify_cell((uint32_t)sample_length, 0U, '?') !=
+        SCREEN_STATUS_OK) {
+        console_panic("screen console did not substitute for an uncovered byte");
+    }
+
+    /*
+     * Filling the last column must wrap to the next row rather than draw off
+     * the edge, and the framebuffer's own bounds check must never be the thing
+     * that catches it.
+     */
+    before = screen_get_state();
+
+    while (screen_get_state().column < before.columns) {
+        if (screen_putc('#') != SCREEN_STATUS_OK) {
+            console_panic("screen console refused to fill a row");
+        }
+    }
+
+    if (screen_putc('#') != SCREEN_STATUS_OK) {
+        console_panic("screen console refused to wrap");
+    }
+
+    after = screen_get_state();
+
+    if (after.row != before.row + 1U || after.column != 1U) {
+        console_panic("screen console did not wrap at the last column");
+    }
+
+    /*
+     * And running off the bottom scrolls rather than stopping. The cursor stays
+     * on the last row while the picture moves, so the count is what changes.
+     */
+    before = screen_get_state();
+
+    while (screen_get_state().row + 1U < before.rows) {
+        if (screen_putc('\n') != SCREEN_STATUS_OK) {
+            console_panic("screen console refused a newline");
+        }
+    }
+
+    if (screen_putc('\n') != SCREEN_STATUS_OK) {
+        console_panic("screen console refused to scroll");
+    }
+
+    after = screen_get_state();
+
+    if (after.scrolls != before.scrolls + 1U) {
+        console_panic("screen console did not scroll at the last row");
+    }
+
+    if (after.row + 1U != before.rows || after.column != 0U) {
+        console_panic("screen console moved the cursor off the last row");
+    }
+
+    /*
+     * A scroll moves every pixel on the screen, so the cheapest complete check
+     * that it did not corrupt the mapping is to draw once more and read it
+     * back. Anything that broke the pitch arithmetic shows up here.
+     */
+    status = screen_clear();
+
+    if (status != SCREEN_STATUS_OK) {
+        console_panic(screen_status_string(status));
+    }
+
+    status = screen_write(sample);
+
+    if (status != SCREEN_STATUS_OK) {
+        console_panic(screen_status_string(status));
+    }
+
+    for (size_t index = 0; index < sample_length; ++index) {
+        if (screen_verify_cell((uint32_t)index, 0U, sample[index]) !=
+            SCREEN_STATUS_OK) {
+            console_panic("screen console does not survive a scroll");
+        }
+    }
+
+    status = screen_clear();
+
+    if (status != SCREEN_STATUS_OK) {
+        console_panic(screen_status_string(status));
+    }
+
+    after = screen_get_state();
+    console_write("Seneri OS: screen console drew ");
+    console_write_u64(after.characters);
+    console_write(" characters and scrolled ");
+    console_write_u64(after.scrolls);
+    console_write(" times\n");
+    console_write("Seneri OS: screen console established\n");
 }

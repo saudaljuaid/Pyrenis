@@ -3,6 +3,7 @@
 #include <stdint.h>
 
 #include <seneri/console.h>
+#include <seneri/screen.h>
 
 #define VGA_WIDTH 80U
 #define VGA_HEIGHT 25U
@@ -89,6 +90,19 @@ void console_initialize(void)
 void console_putc(char character)
 {
     serial_putc(character);
+
+    /*
+     * And the framebuffer, once there is one. This is deliberately additive:
+     * the serial port and the VGA text buffer keep working exactly as they did,
+     * because the test harness reads the serial log and a change that quietly
+     * moved the transcript would break every scenario at once.
+     *
+     * screen_putc refuses cleanly before src/kernel/screen.c is initialized, so
+     * this needs no guard of its own and the early boot path is unchanged.
+     */
+    if (screen_is_active()) {
+        (void)screen_putc(character);
+    }
 
     if (character == '\n') {
         console_column = 0;
