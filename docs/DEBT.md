@@ -20,6 +20,13 @@ increment, and a test harness whose contract is now ninety-one shell assertions.
 The debt is real but it is the cheap kind. It is written down before it is
 expensive rather than after.
 
+**Two of the seven are now paid** — the branch census in §1 and the `kernel.c`
+split in §2 — and both are kept below with what they cost rather than deleted,
+because an entry that predicted its own price and was then proved right is worth
+more as a record than as a blank space. §2 in particular warned that deferring
+it would make the move bigger, and the next increment added 221 lines before
+anyone acted on it.
+
 ## Paid on the way in
 
 Found while writing this register, fixed in the same commit.
@@ -48,9 +55,9 @@ to `0x23`–`0x27` and `0x22` is reserved by name in both `test.c` and the
 `Makefile`. The two changes can now land in either order without one silently
 passing as the other.
 
-**The pile of unmerged branches is not a pile.** `git branch -r` shows eighteen
-branches and `git branch -r --no-merged origin/main` shows all eighteen, which
-reads as eighteen abandoned lines of work. It is not. Every pull request in this
+**The pile of unmerged branches was not a pile.** `git branch -r` showed
+eighteen branches and `git branch -r --no-merged origin/main` showed all
+eighteen, which reads as eighteen abandoned lines of work. It was not. Every pull request in this
 repository was squash-merged, and a squash merge leaves the original branch tip
 unreachable from `main` even though every line of it landed. The reachability
 question is the wrong one; the patch question is the right one:
@@ -75,14 +82,11 @@ them — `claude/seneri-acpi-pm-timer-k69tgx` (#23) and `seneri-os-c-update-2gc9
 (#14) — belong to pull requests closed unmerged as duplicates, and their content
 reached `main` through #24 and #17 respectively. `git cherry` agrees.
 
-They cost nothing to keep except the false impression they create, which is the
-whole reason this entry exists. Deleting them is one command per branch and the
-commits stay recoverable from each pull request's page:
-
-    git push origin --delete <branch>
-
-That is a decision about someone else's repository, so it is written down here
-rather than done.
+**They are gone.** All sixteen were deleted in one push once the census above
+had been checked three ways; the commits remain recoverable from each pull
+request's page. The remote now holds three branches — `main` and the two open
+pull requests — which is what the repository actually contains and now what it
+looks like.
 
 **This census was broken before it was believed.** Patch identity is not proof,
 so the claim was re-checked a second way and then the checker itself was
@@ -106,25 +110,58 @@ resolutions, and there are more of them every increment that lands on either
 side. **Both branches merge cleanly with `main` today.** The order that costs
 least is #31 first, then #32.
 
-### 2. `kernel.c` has become the place proofs go to live
+### 2. `kernel.c` was the place proofs went to live — paid
 
     $ wc -l src/kernel/kernel.c
-    2211          # 1256 at the start of this session; 1990 when this file was written
+    399           # 1256 at the start of the session, 1990 when this entry was
+                  # written, 2211 one increment later
 
-Every increment adds a `prove_X()` and every `prove_X()` lands here, so the file
-grows once per subsystem regardless of how well factored that subsystem is. It
-is now the third largest file in the kernel and the only one with no single
-responsibility.
+**Split.** Every increment added a `prove_X()` and every `prove_X()` landed
+here, so the file grew once per subsystem regardless of how well factored that
+subsystem was. This entry warned that each increment landing first would make
+the move bigger, and then the next increment added 221 lines and proved it.
 
-**This entry has already been proved right once.** It was written at 1,990
-lines, warning that each increment landing first makes the move bigger. The very
-next increment — preemption — added 221 more. That is the cost of deferring it,
-measured rather than predicted.
+The split follows the second option this entry offered — a file the boot
+sequence calls in order — divided by what a function is permitted to do:
 
-The fix is not clever: boot proofs belong beside the subsystems they prove, or
-in a `src/kernel/boot_proofs.c` that `kernel_main` calls in order. Doing it is
-mechanical. Doing it *before* the next few increments is the point, because each
-one that lands first makes the move bigger.
+| | | |
+| --- | ---: | --- |
+| `src/kernel/kernel.c` | 399 | the order boot happens in, and nothing else |
+| `src/kernel/boot_report.c` | 271 | describes what was found, never decides, never panics |
+| `src/kernel/boot_proofs.c` | 1648 | decides, and panics when the answer is wrong |
+
+`include/seneri/boot_stages.h` declares the twenty-eight functions that moved.
+None of them is a general-purpose interface — each is called exactly once, from
+`kernel_main` — and the header says so, so nobody mistakes the split for an API.
+
+One coupling was removed rather than carried across: `bring_up_pci` read
+`boot_mcfg` and `boot_mcfg_present` out of `kernel.c`'s file scope. It takes
+them as parameters now. A hidden read of another translation unit's state is not
+something a split should preserve.
+
+**The refactor changed no behaviour, and that was checked rather than assumed.**
+A refactor's correctness condition is that the observable output is identical,
+so the boot transcript was captured before the split and compared after, with
+only the six timing-dependent lines masked:
+
+| Control | Result |
+| --- | --- |
+| Compare the 100-line boot transcript before and after. | Identical, byte for byte. |
+| Change one word of one transcript line. | `PCI enumeration established` → `ESTABLISHED` caught at line 94. |
+| Change a line inside the moved code. | `PCI buses` → `PCI BUSES` caught at line 57. |
+| Delete a whole proof call from `kernel_main`. | Three lines vanish from the transcript and the comparison reports them. |
+
+The last three exist because a comparison that cannot fail proves nothing, and
+the masking of timing lines is exactly the kind of thing that quietly makes a
+comparison blind.
+
+All twenty-three QEMU scenarios pass, and `nm -u` is still empty.
+
+**What this does not fix.** `boot_proofs.c` is 1,648 lines and is now the third
+largest file here. It has a single responsibility, which the old `kernel.c` did
+not, so it is a better 1,648 lines — but the first option this entry offered,
+moving each proof beside the subsystem it proves, is still the better end state
+and is still undone.
 
 ### 3. Signatures growing a parameter per increment
 
