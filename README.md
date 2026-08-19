@@ -73,6 +73,7 @@ Seneri OS: deadline table of 32 entries on the heap
 Seneri OS: PCI configuration space enumerated
 Seneri OS: PCI enumeration established
 Seneri OS: kernel threads established
+Seneri OS: preemption established
 Seneri OS: framebuffer established
 Seneri OS: logo established
 ```
@@ -228,9 +229,11 @@ deadline table is obtained from it at `timer_start` and returned at
 arrays, and converting each is its own change. The heap never
 shrinks — though the page tables underneath it are now reclaimed when an unmap
 empties them — and `timer_sleep_ns` still halts rather than
-blocking, so nothing sleeps concurrently yet — the threads now exist, but the
-scheduler is cooperative and a sleep does not yield to it. Making a sleep a block
-is the increment that changes that, and it needs preemption first. The kernel is still identity-mapped rather than
+blocking, so nothing sleeps concurrently yet. The scheduler now takes the
+processor back on its own — three threads whose bodies contain no scheduler call
+at all are timesliced within 2% of each other — but a sleeping thread still
+holds its turn instead of leaving the run queue, and turning a sleep into a block
+is the increment that changes that. The kernel is still identity-mapped rather than
 higher-half, a 4 KiB change inside a 2 MiB mapping is refused rather than split,
 and the page-fault handler stays fatal: there is no demand paging. There is no
 wall-clock date, only time since boot. The supported target still reports no

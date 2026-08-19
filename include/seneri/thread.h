@@ -53,6 +53,15 @@
  */
 #define THREAD_MAX 8U
 
+/*
+ * How long a thread may hold the processor before the scheduler takes it back.
+ *
+ * Two milliseconds is short enough that three threads visibly interleave inside
+ * a boot proof, and long enough that the fixed cost of a switch is a rounding
+ * error against it. It is a Seneri policy number, not an architectural one.
+ */
+#define THREAD_QUANTUM_NS UINT64_C(2000000)
+
 /* Identifiers are never zero, so zero can mean "no thread" without a flag. */
 #define THREAD_ID_NONE UINT64_C(0)
 
@@ -77,6 +86,10 @@ enum thread_status {
     THREAD_STATUS_BAD_IDENTIFIER,
     THREAD_STATUS_NOT_THE_BOOT_THREAD,
     THREAD_STATUS_THREADS_STILL_RUNNABLE,
+    THREAD_STATUS_NO_TIMER,
+    THREAD_STATUS_NO_QUANTUM,
+    THREAD_STATUS_ALREADY_PREEMPTIVE,
+    THREAD_STATUS_NOT_PREEMPTIVE,
     THREAD_STATUS_VALIDATION_FAILURE
 };
 
@@ -107,6 +120,11 @@ struct thread_system_state {
     uint64_t current;
     uint64_t switches;
     uint64_t stack_frames;
+    /* Switches that nobody asked for: the quantum expired and took the
+     * processor back. Counted apart from voluntary yields because a scheduler
+     * that only ever switches when asked is a cooperative one wearing a timer. */
+    uint64_t preemptions;
+    bool preemptive;
 };
 
 /*
@@ -130,6 +148,32 @@ enum thread_status thread_create(
  * than a failure.
  */
 void thread_yield(void);
+
+/*
+ * Start taking the processor back.
+ *
+ * Preemption rides on the deadline timer rather than on a periodic tick of its
+ * own: the scheduler arms a deadline one quantum ahead, and the callback arms
+ * the next one. That reuses machinery `docs/MONOTONIC_TIME.md` already proves,
+ * and it means there is one owner of the local APIC timer rather than two.
+ *
+ * Requires the deadline timer to be started, and refuses by name if it is not.
+ */
+enum thread_status thread_enable_preemption(void);
+enum thread_status thread_disable_preemption(void);
+bool thread_preemption_enabled(void);
+
+/*
+ * Called by the interrupt dispatcher after the interrupt has been acknowledged,
+ * and never from anywhere else. A no-op unless a quantum expired while this
+ * thread was running.
+ *
+ * The switch happens here rather than inside the timer callback because the end
+ * of interrupt follows the handler: a callback that switched away would strand
+ * its own acknowledgement, the local APIC would keep the vector in service, and
+ * preemption would stop after exactly one switch.
+ */
+void thread_on_interrupt_return(void);
 
 /* Never returns. Reached implicitly when a thread's entry function returns. */
 _Noreturn void thread_exit(void);

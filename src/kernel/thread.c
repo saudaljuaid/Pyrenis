@@ -3,12 +3,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <seneri/clock.h>
 #include <seneri/console.h>
 #include <seneri/cpu.h>
 #include <seneri/heap.h>
 #include <seneri/memory.h>
 #include <seneri/paging.h>
 #include <seneri/thread.h>
+#include <seneri/timer.h>
 
 /*
  * More than one thread of control, on one core, cooperatively scheduled.
@@ -47,11 +49,27 @@
 #define SLOT_RETURN 7U
 
 /*
+ * The flags a thread starts life with.
+ *
  * Intel SDM volume 1 section 3.4.3: bit 1 of RFLAGS is reserved and always
- * reads as one. Every other bit starts clear, which means a new thread begins
- * with interrupts disabled and the direction flag clear, as the ABI requires.
+ * reads as one, and bit 9 is the interrupt enable. The direction flag stays
+ * clear, as the ABI requires of any function entry.
+ *
+ * Interrupts start *enabled*, and that is load-bearing rather than incidental.
+ * A thread that begins with them disabled and never yields can never be
+ * preempted, because the quantum that would take the processor back is an
+ * interrupt it is refusing to take - so the first such thread scheduled locks
+ * the machine. This layer shipped with them disabled, which was invisible for
+ * exactly as long as every thread yielded voluntarily; the preemption proof
+ * hung on its first run. A schedulable thread is an interruptible one.
+ *
+ * The consequence is worth stating: a thread cannot assume it holds a critical
+ * section on entry. Anything that needs one takes it itself.
  */
-#define INITIAL_RFLAGS UINT64_C(0x0000000000000002)
+#define RFLAGS_RESERVED UINT64_C(0x0000000000000002)
+#define RFLAGS_INTERRUPT_ENABLE UINT64_C(0x0000000000000200)
+#define RFLAGS_DIRECTION UINT64_C(0x0000000000000400)
+#define INITIAL_RFLAGS (RFLAGS_RESERVED | RFLAGS_INTERRUPT_ENABLE)
 
 struct thread {
     uint64_t stack_pointer;
@@ -69,6 +87,16 @@ static struct thread_system_state state;
 static struct thread *threads;
 static size_t current_slot;
 static uint64_t next_identifier;
+
+/*
+ * Set by the quantum callback inside the timer interrupt, read and cleared by
+ * thread_on_interrupt_return once that interrupt has been acknowledged.
+ * Volatile because the only thing ordering those two is the hardware.
+ */
+static volatile bool reschedule_pending;
+static uint64_t quantum_identifier;
+
+static void quantum_expired(uint64_t deadline_ns, void *context);
 
 static uint64_t slot_guard_page(size_t slot)
 {
@@ -322,6 +350,10 @@ enum thread_status thread_start(void)
     boot->stack_top = 0U;
     current_slot = 0U;
     state.current = boot->identifier;
+    state.preemptions = 0U;
+    state.preemptive = false;
+    reschedule_pending = false;
+    quantum_identifier = THREAD_ID_NONE;
     state.active = true;
     recount();
     return THREAD_STATUS_OK;
@@ -387,15 +419,25 @@ enum thread_status thread_create(
     return THREAD_STATUS_OK;
 }
 
-void thread_yield(void)
+/*
+ * Hand the processor to the next ready thread, if there is one.
+ *
+ * The run queue is mutated with interrupts disabled and restored afterwards to
+ * whatever this thread had. Once a timer can preempt, a quantum expiring
+ * halfway through this function would leave the table describing a switch that
+ * had not happened - so the window is closed rather than argued about.
+ *
+ * `interrupted` lives on this thread's own stack, so when this thread is
+ * resumed - possibly minutes later, from another thread's quantum - it still
+ * holds this thread's answer rather than the resumer's.
+ */
+static void switch_to_next(void)
 {
+    const bool interrupted = cpu_interrupts_enabled();
     size_t previous;
     size_t next;
 
-    if (!state.active) {
-        return;
-    }
-
+    cpu_interrupt_disable();
     previous = current_slot;
     next = next_ready_slot(previous);
 
@@ -404,6 +446,10 @@ void thread_yield(void)
      * to be descheduled and there is no one to schedule, so it keeps running.
      */
     if (next == previous) {
+        if (interrupted) {
+            cpu_interrupt_enable();
+        }
+
         return;
     }
 
@@ -422,6 +468,144 @@ void thread_yield(void)
      */
     thread_switch_context(&threads[previous].stack_pointer,
         threads[next].stack_pointer);
+
+    if (interrupted) {
+        cpu_interrupt_enable();
+    }
+}
+
+void thread_yield(void)
+{
+    if (!state.active) {
+        return;
+    }
+
+    switch_to_next();
+}
+
+static enum thread_status arm_quantum(void)
+{
+    const uint64_t deadline = clock_monotonic_ns() + THREAD_QUANTUM_NS;
+
+    if (timer_arm(deadline, quantum_expired, NULL, &quantum_identifier) !=
+        TIMER_STATUS_OK) {
+        quantum_identifier = THREAD_ID_NONE;
+        return THREAD_STATUS_NO_QUANTUM;
+    }
+
+    return THREAD_STATUS_OK;
+}
+
+/*
+ * The end of a thread's turn, running inside the timer interrupt.
+ *
+ * It does two things and neither of them is the switch. It arms the next
+ * quantum - unconditionally, so that a quantum which finds nothing to switch to
+ * still leaves a successor behind - and it records that a switch is owed. The
+ * switch itself waits for thread_on_interrupt_return, because the end of
+ * interrupt has not been sent yet and a callback that switched away would
+ * strand it.
+ */
+static void quantum_expired(uint64_t deadline_ns, void *context)
+{
+    (void)deadline_ns;
+    (void)context;
+
+    quantum_identifier = THREAD_ID_NONE;
+
+    if (!state.active || !state.preemptive) {
+        return;
+    }
+
+    if (arm_quantum() != THREAD_STATUS_OK) {
+        console_panic("the scheduler could not arm its next quantum");
+    }
+
+    /*
+     * Only worth a switch if somebody else is ready. A single runnable thread
+     * preempted into itself would count a preemption that never happened.
+     */
+    if (next_ready_slot(current_slot) != current_slot) {
+        reschedule_pending = true;
+        state.preemptions += 1U;
+    }
+}
+
+void thread_on_interrupt_return(void)
+{
+    if (!reschedule_pending) {
+        return;
+    }
+
+    reschedule_pending = false;
+
+    if (!state.active) {
+        return;
+    }
+
+    switch_to_next();
+}
+
+enum thread_status thread_enable_preemption(void)
+{
+    enum thread_status status;
+
+    if (!state.active) {
+        return THREAD_STATUS_NOT_STARTED;
+    }
+
+    if (state.preemptive) {
+        return THREAD_STATUS_ALREADY_PREEMPTIVE;
+    }
+
+    /*
+     * The quantum is a deadline, so the deadline layer has to be running. This
+     * is the refusal that keeps the dependency explicit rather than letting a
+     * scheduler start that can never be interrupted.
+     */
+    if (!timer_is_started()) {
+        return THREAD_STATUS_NO_TIMER;
+    }
+
+    state.preemptive = true;
+    status = arm_quantum();
+
+    if (status != THREAD_STATUS_OK) {
+        state.preemptive = false;
+    }
+
+    return status;
+}
+
+enum thread_status thread_disable_preemption(void)
+{
+    if (!state.active) {
+        return THREAD_STATUS_NOT_STARTED;
+    }
+
+    if (!state.preemptive) {
+        return THREAD_STATUS_NOT_PREEMPTIVE;
+    }
+
+    state.preemptive = false;
+
+    if (quantum_identifier != THREAD_ID_NONE) {
+        (void)timer_cancel(quantum_identifier);
+        quantum_identifier = THREAD_ID_NONE;
+    }
+
+    /*
+     * A quantum may already have fired and be waiting to be honoured. Dropping
+     * it here means disabling preemption cannot be followed by one last
+     * involuntary switch.
+     */
+    reschedule_pending = false;
+    return THREAD_STATUS_OK;
+}
+
+bool thread_preemption_enabled(void)
+{
+    return state.active && state.preemptive;
 }
 
 _Noreturn void thread_exit(void)
@@ -517,6 +701,15 @@ enum thread_status thread_stop(void)
     }
 
     /*
+     * Stop being preemptible before dismantling the table the scheduler reads.
+     * A quantum landing between here and the last free would find a run queue
+     * that is being taken apart.
+     */
+    if (state.preemptive) {
+        (void)thread_disable_preemption();
+    }
+
+    /*
      * Every other thread must have exited. Tearing down while one is merely
      * ready would unmap a stack that still holds a suspended thread's frame,
      * and the failure would surface as a fault at an address belonging to a
@@ -551,6 +744,9 @@ enum thread_status thread_stop(void)
 
     threads = NULL;
     state.active = false;
+    state.preemptive = false;
+    reschedule_pending = false;
+    quantum_identifier = THREAD_ID_NONE;
     state.capacity = 0U;
     state.live = 0U;
     state.ready = 0U;
@@ -727,6 +923,10 @@ const char *thread_status_string(enum thread_status status)
         "no thread carries that identifier",
         "only the boot thread may stop the scheduler",
         "a thread is still runnable",
+        "preemption needs the deadline timer started",
+        "the scheduler could not arm a quantum",
+        "preemption is already enabled",
+        "preemption is not enabled",
         "thread table does not match the address space"
     };
 
@@ -868,13 +1068,14 @@ static bool prepared_frame_is_right(void)
         frame[SLOT_RBX] == 0U && frame[SLOT_RBP] == 0U;
 
     /*
-     * The reserved bit of RFLAGS must be set and the interrupt enable and
-     * direction flags must be clear. A thread that started with the direction
-     * flag set would corrupt every string operation it made.
+     * The reserved bit must be set, the direction flag must be clear - a thread
+     * that started with it set would corrupt every string operation it made -
+     * and interrupts must be *enabled*, because a thread that cannot take an
+     * interrupt cannot be preempted and will hold the processor for ever.
      */
-    correct = correct && (INITIAL_RFLAGS & UINT64_C(0x2)) != 0U &&
-        (INITIAL_RFLAGS & UINT64_C(0x200)) == 0U &&
-        (INITIAL_RFLAGS & UINT64_C(0x400)) == 0U;
+    correct = correct && (INITIAL_RFLAGS & RFLAGS_RESERVED) != 0U &&
+        (INITIAL_RFLAGS & RFLAGS_INTERRUPT_ENABLE) != 0U &&
+        (INITIAL_RFLAGS & RFLAGS_DIRECTION) == 0U;
 
     /* Nothing below the frame was touched, so a stack cannot be over-written
      * on creation. */

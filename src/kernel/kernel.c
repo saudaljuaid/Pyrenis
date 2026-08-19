@@ -62,6 +62,21 @@
 #define THREAD_PROOF_LOG (THREAD_PROOF_THREADS * THREAD_PROOF_ROUNDS)
 
 /*
+ * How many times each preemption worker must be scheduled before the proof is
+ * satisfied. Three is enough to distinguish "the scheduler rotated once" from
+ * "the scheduler keeps rotating", and small enough that the whole proof fits in
+ * a handful of quanta.
+ */
+#define PREEMPT_PROOF_TURNS 3U
+
+/*
+ * The proof refuses to wait longer than this. Every worker spins without ever
+ * yielding, so a scheduler that stopped preempting would otherwise hang the
+ * boot instead of failing it - and a hang is a timeout rather than a diagnosis.
+ */
+#define PREEMPT_PROOF_LIMIT_NS UINT64_C(2000000000)
+
+/*
  * What the screen is cleared to before the logo is drawn: a near-black with a
  * slight blue bias, so the logo's own edges have something to sit against
  * rather than a pure black that hides how they were composited.
@@ -1616,6 +1631,189 @@ static void draw_logo(void)
     console_write("Seneri OS: logo established\n");
 }
 
+/*
+ * Written by threads that never call into the scheduler, read by a thread that
+ * is itself being preempted. Volatile because nothing in the C abstract machine
+ * orders these: the only thing that does is a timer interrupt.
+ */
+static volatile bool preempt_stop;
+static volatile uint64_t preempt_work[THREAD_PROOF_THREADS];
+
+static void preempt_worker(void *context)
+{
+    const size_t index = (size_t)(uintptr_t)context;
+
+    /*
+     * The entire point: this loop contains no thread_yield, no sleep, and no
+     * call that could reach the scheduler. If it is ever descheduled, something
+     * took the processor away from it.
+     */
+    while (!preempt_stop) {
+        preempt_work[index] += 1U;
+    }
+}
+
+/*
+ * Take the processor back from a thread that never offers it.
+ *
+ * Cooperative scheduling was proved by threads that yield; that proves the
+ * switch works, not that the scheduler is in charge. This proves the harder
+ * claim, and it is the one every driver and every sleep above this layer
+ * depends on: a thread that does nothing but spin is still descheduled, on a
+ * schedule the kernel sets rather than one the thread agrees to.
+ */
+static void prove_preemption(void)
+{
+    struct thread_state_report report;
+    struct thread_system_state threads;
+    uint64_t identifiers[THREAD_PROOF_THREADS];
+    uint64_t started_ns;
+    size_t satisfied = 0U;
+    enum thread_status status;
+
+    preempt_stop = false;
+
+    for (size_t index = 0; index < THREAD_PROOF_THREADS; ++index) {
+        preempt_work[index] = 0U;
+    }
+
+    status = thread_start();
+
+    if (status != THREAD_STATUS_OK) {
+        console_panic(thread_status_string(status));
+    }
+
+    /*
+     * Preemption is a deadline, so the deadline layer must be running. Asked
+     * for before it is, so the refusal is proved rather than assumed.
+     */
+    if (!timer_is_started()) {
+        console_panic("the deadline timer stopped before preemption");
+    }
+
+    for (size_t index = 0; index < THREAD_PROOF_THREADS; ++index) {
+        status = thread_create(
+            preempt_worker,
+            (void *)(uintptr_t)index,
+            &identifiers[index]
+        );
+
+        if (status != THREAD_STATUS_OK) {
+            console_panic(thread_status_string(status));
+        }
+    }
+
+    status = thread_enable_preemption();
+
+    if (status != THREAD_STATUS_OK) {
+        console_panic(thread_status_string(status));
+    }
+
+    if (thread_enable_preemption() != THREAD_STATUS_ALREADY_PREEMPTIVE) {
+        console_panic("preemption was enabled twice");
+    }
+
+    started_ns = clock_monotonic_ns();
+
+    /*
+     * Nothing below here yields. The boot thread spins on the same terms as
+     * the workers, and only makes progress because it is preempted too.
+     */
+    cpu_interrupt_enable();
+
+    while (satisfied < THREAD_PROOF_THREADS) {
+        satisfied = 0U;
+
+        for (size_t index = 0; index < THREAD_PROOF_THREADS; ++index) {
+            if (thread_report(identifiers[index], &report) ==
+                    THREAD_STATUS_OK &&
+                report.switches >= PREEMPT_PROOF_TURNS) {
+                ++satisfied;
+            }
+        }
+
+        if (clock_monotonic_ns() - started_ns > PREEMPT_PROOF_LIMIT_NS) {
+            cpu_interrupt_disable();
+            console_panic("threads were not preempted within the time limit");
+        }
+    }
+
+    preempt_stop = true;
+
+    for (size_t index = 0; index < THREAD_PROOF_THREADS; ++index) {
+        status = thread_join(identifiers[index]);
+
+        if (status != THREAD_STATUS_OK) {
+            cpu_interrupt_disable();
+            console_panic(thread_status_string(status));
+        }
+    }
+
+    cpu_interrupt_disable();
+    threads = thread_get_state();
+
+    console_write("Seneri OS: preempted ");
+    console_write_u64(threads.preemptions);
+    console_write(" times across ");
+    console_write_u64(threads.switches);
+    console_write(" switches in ");
+    console_write_u64((clock_monotonic_ns() - started_ns) / 1000000U);
+    console_write(" ms\n");
+
+    console_write("Seneri OS: unyielding threads ran");
+
+    for (size_t index = 0; index < THREAD_PROOF_THREADS; ++index) {
+        console_putc(' ');
+        console_write_u64(preempt_work[index]);
+    }
+
+    console_putc('\n');
+
+    /*
+     * Every worker must have done work and been scheduled repeatedly. A
+     * scheduler that started all three and then let one monopolise the
+     * processor would satisfy neither.
+     */
+    for (size_t index = 0; index < THREAD_PROOF_THREADS; ++index) {
+        if (preempt_work[index] == 0U) {
+            console_panic("a thread was never given the processor");
+        }
+
+        if (thread_report(identifiers[index], &report) != THREAD_STATUS_OK ||
+            report.switches < PREEMPT_PROOF_TURNS) {
+            console_panic("a thread was not preempted back into");
+        }
+    }
+
+    /*
+     * The claim this proof exists for. Every switch here was involuntary:
+     * nothing in preempt_worker can reach the scheduler, and the boot thread
+     * only called thread_join after the spinning was over.
+     */
+    if (threads.preemptions < PREEMPT_PROOF_TURNS) {
+        console_panic("the scheduler never took the processor back");
+    }
+
+    status = thread_disable_preemption();
+
+    if (status != THREAD_STATUS_OK) {
+        console_panic(thread_status_string(status));
+    }
+
+    if (thread_preemption_enabled() ||
+        thread_disable_preemption() != THREAD_STATUS_NOT_PREEMPTIVE) {
+        console_panic("preemption did not stop");
+    }
+
+    status = thread_stop();
+
+    if (status != THREAD_STATUS_OK) {
+        console_panic(thread_status_string(status));
+    }
+
+    console_write("Seneri OS: preemption established\n");
+}
+
 static void prove_frame_lifecycle(void)
 {
     uintptr_t first_frame;
@@ -1931,6 +2129,7 @@ _Noreturn void kernel_main(uint32_t magic, uintptr_t boot_information)
     prove_monotonic_time();
     bring_up_pci();
     prove_threads();
+    prove_preemption();
     prove_framebuffer(&context.framebuffer);
 
     if (framebuffer_is_active()) {
@@ -1999,6 +2198,7 @@ _Noreturn void kernel_main(uint32_t magic, uintptr_t boot_information)
     console_write("Seneri OS: kernel heap established\n");
     console_write("Seneri OS: PCI enumeration established\n");
     console_write("Seneri OS: kernel threads passed\n");
+    console_write("Seneri OS: preemption passed\n");
     console_write("Seneri OS: framebuffer passed\n");
     console_write("Seneri OS: logo passed\n");
     console_write("Seneri OS: never triple fault milestone passed\n");
