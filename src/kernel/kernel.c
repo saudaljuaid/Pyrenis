@@ -15,6 +15,7 @@
 #include <seneri/ioapic.h>
 #include <seneri/memory.h>
 #include <seneri/paging.h>
+#include <seneri/pci.h>
 #include <seneri/pic.h>
 #include <seneri/pit.h>
 #include <seneri/pm_timer.h>
@@ -631,11 +632,14 @@ static void prove_monotonic_time(void)
  * period. The pattern each time is the same: the check was necessary and was
  * never sufficient.
  */
-static void install_page_tables(const struct acpi_topology *topology)
+static void install_page_tables(
+    const struct acpi_topology *topology,
+    const struct acpi_mcfg *mcfg
+)
 {
     struct paging_state paging;
     struct paging_audit audit;
-    enum paging_status status = paging_initialize(topology);
+    enum paging_status status = paging_initialize(topology, mcfg);
 
     if (status != PAGING_STATUS_OK) {
         console_panic(paging_status_string(status));
@@ -985,6 +989,131 @@ static void prove_heap_lifecycle(void)
     console_write("Seneri OS: heap coalesced to one free block\n");
 }
 
+/*
+ * Count what is actually on the machine.
+ *
+ * Every driver Seneri will ever have begins here, because nothing above this
+ * layer can name a device that nothing below it has found. The enumeration is
+ * read-only on purpose: sizing a base address register means writing all ones
+ * into it, and a boot that only counts devices has no business disturbing one.
+ *
+ * It runs last because it needs everything under it - the heap for its table,
+ * the page tables for the uncacheable window, and interrupts disabled so the
+ * two halves of a port access cannot be separated.
+ */
+static void bring_up_pci(void)
+{
+    struct pci_state pci;
+    enum pci_status status;
+
+    if (cpu_interrupts_enabled()) {
+        console_panic("PCI enumeration ran with interrupts enabled");
+    }
+
+    status = pci_initialize(&boot_mcfg, boot_mcfg_present);
+
+    if (status != PCI_STATUS_OK) {
+        console_panic(pci_status_string(status));
+    }
+
+    pci = pci_get_state();
+    console_write("Seneri OS: PCI mechanism 1 online, ");
+    console_write(pci.ecam_active ? "window mapped at " : "no window mapped");
+
+    if (pci.ecam_active) {
+        console_write_hex(pci.ecam_base);
+        console_write(" buses ");
+        console_write_u64(pci.ecam_start_bus);
+        console_write(" to ");
+        console_write_u64(pci.ecam_end_bus);
+    }
+
+    console_putc('\n');
+    console_write("Seneri OS: PCI buses ");
+    console_write_u64(pci.bus_count);
+    console_write(" functions ");
+    console_write_u64(pci.function_count);
+    console_write(" bridges ");
+    console_write_u64(pci.bridge_count);
+    console_putc('\n');
+
+    for (size_t index = 0; index < pci.function_count; ++index) {
+        const struct pci_function *function = pci_function_at(index);
+
+        if (function == NULL) {
+            console_panic("PCI reported a function it cannot return");
+        }
+
+        console_write("Seneri OS: PCI ");
+        console_write_u64(function->address.bus);
+        console_putc(':');
+        console_write_u64(function->address.device);
+        console_putc('.');
+        console_write_u64(function->address.function);
+        console_write(" vendor ");
+        console_write_hex(function->vendor_id);
+        console_write(" device ");
+        console_write_hex(function->device_id);
+        console_write(" class ");
+        console_write_hex(function->class_code);
+        console_putc('.');
+        console_write_hex(function->subclass);
+        console_putc(' ');
+        console_write(pci_class_string(function->class_code));
+        console_write(" caps ");
+        console_write_u64(function->capability_count);
+
+        if (function->msi_offset != 0U) {
+            console_write(" MSI");
+        }
+
+        if (function->msi_x_offset != 0U) {
+            console_write(" MSI-X");
+        }
+
+        if (function->express_offset != 0U) {
+            console_write(" PCIe");
+        }
+
+        console_putc('\n');
+    }
+
+    /*
+     * The host bridge is function zero of device zero of bus zero on every
+     * machine that has PCI at all. Requiring it by class rather than by count
+     * is what makes this a check on the decoding rather than on the machine
+     * happening to have some devices.
+     */
+    if (pci_find_class(PCI_CLASS_BRIDGE, PCI_SUBCLASS_HOST_BRIDGE) == NULL) {
+        console_panic("PCI enumeration found no host bridge");
+    }
+
+    if (pci.function_count == 0U || pci.bus_count == 0U) {
+        console_panic("PCI enumeration found no functions");
+    }
+
+    console_write("Seneri OS: PCI configuration space enumerated\n");
+
+    /*
+     * The claim the second mechanism exists to make. Two readers built
+     * independently, reaching the same registers by completely different
+     * routes, agreeing register for register. On a machine with no window there
+     * is nothing to compare, and saying so is better than reporting a
+     * comparison that did not happen.
+     */
+    console_write("Seneri OS: PCI mechanisms agree on ");
+    console_write_u64(pci.compared_dwords);
+    console_write(" registers of ");
+    console_write_u64(pci.compared_functions);
+    console_write(" functions, ");
+    console_write_u64(pci.volatile_dwords);
+    console_write(" unstable\n");
+
+    if (pci.ecam_active && pci.compared_functions == 0U) {
+        console_panic("a mapped configuration window compared nothing");
+    }
+}
+
 static void prove_frame_lifecycle(void)
 {
     uintptr_t first_frame;
@@ -1059,6 +1188,7 @@ _Noreturn void kernel_main(uint32_t magic, uintptr_t boot_information)
     enum kernel_test_scenario test_scenario;
     enum heap_status heap_status;
     enum paging_status paging_status;
+    enum pci_status pci_status;
     enum pm_timer_status pm_timer_status;
 
     console_initialize();
@@ -1128,6 +1258,10 @@ _Noreturn void kernel_main(uint32_t magic, uintptr_t boot_information)
 
     if (!heap_self_test()) {
         console_panic("kernel heap block table self-test failed");
+    }
+
+    if (!pci_self_test()) {
+        console_panic("PCI configuration arithmetic self-test failed");
     }
 
     console_write("Seneri OS: parser rejection tests passed\n");
@@ -1236,7 +1370,8 @@ _Noreturn void kernel_main(uint32_t magic, uintptr_t boot_information)
      * here. It has to run before the scenarios, because every one of them now
      * executes on the kernel's own hierarchy rather than on boot.S's.
      */
-    install_page_tables(&boot_topology);
+    install_page_tables(&boot_topology,
+        boot_mcfg_present ? &boot_mcfg : NULL);
     prove_paging_lifecycle();
     bring_up_heap();
     prove_heap_lifecycle();
@@ -1244,7 +1379,8 @@ _Noreturn void kernel_main(uint32_t magic, uintptr_t boot_information)
     console_write("Seneri OS: day one passed\n");
     console_write("Seneri OS: memory foundation passed\n");
     test_scenario = kernel_test_select(&context);
-    kernel_test_run(test_scenario);
+    kernel_test_run(test_scenario, boot_mcfg_present ? &boot_mcfg : NULL,
+        boot_mcfg_present);
 
     if (!interrupt_breakpoint_self_test()) {
         console_panic("breakpoint register self-test failed");
@@ -1275,6 +1411,7 @@ _Noreturn void kernel_main(uint32_t magic, uintptr_t boot_information)
     retire_pit();
     prove_clocks_without_pit();
     prove_monotonic_time();
+    bring_up_pci();
 
     /*
      * Re-walk the installed hierarchy at the end of boot. Everything between
@@ -1294,6 +1431,12 @@ _Noreturn void kernel_main(uint32_t magic, uintptr_t boot_information)
         console_panic(heap_status_string(heap_status));
     }
 
+    pci_status = pci_verify();
+
+    if (pci_status != PCI_STATUS_OK) {
+        console_panic(pci_status_string(pci_status));
+    }
+
     console_write("Seneri OS: exception probes passed\n");
     console_write("Seneri OS: PIC spurious paths passed\n");
     console_write("Seneri OS: PIT delivered eight interrupts\n");
@@ -1309,6 +1452,7 @@ _Noreturn void kernel_main(uint32_t magic, uintptr_t boot_information)
     console_write("Seneri OS: monotonic time established\n");
     console_write("Seneri OS: virtual memory established\n");
     console_write("Seneri OS: kernel heap established\n");
+    console_write("Seneri OS: PCI enumeration established\n");
     console_write("Seneri OS: never triple fault milestone passed\n");
 
     if (test_scenario == KERNEL_TEST_NORMAL) {

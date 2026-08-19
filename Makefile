@@ -8,7 +8,7 @@ SERIAL_LOG := $(BUILD_DIR)/serial.log
 TEST_BUILD_DIR := $(BUILD_DIR)/tests
 TEST_SCENARIOS := normal breakpoint invalid-opcode page-fault ist pit unexpected \
 	double-fault apic ioapic retired apic-timer tsc pm-timer pit-retired timers \
-	paging heap
+	paging heap pci pci-ecam
 TEST_TARGETS := $(addprefix qemu-test-,$(TEST_SCENARIOS))
 
 CC := gcc
@@ -130,13 +130,25 @@ qemu-test-%: $(TEST_BUILD_DIR)/%/seneri.iso
 		timers) expected=63 ;; \
 		paging) expected=65 ;; \
 		heap) expected=67 ;; \
+		pci) expected=69 ;; \
+		pci-ecam) expected=71 ;; \
 		*) echo 'unknown QEMU scenario: $*'; exit 1 ;; \
+	esac; \
+	# Only pci-ecam departs from the default machine. i440fx publishes no \
+	# MCFG, so every other scenario - including pci - proves the path that \
+	# has nothing but the I/O ports. q35 is the only machine here with a \
+	# PCI Express host bridge, and the root port is what gives the \
+	# enumeration a second bus to find. \
+	case '$*' in \
+		pci-ecam) \
+			hardware='-machine q35 -device pcie-root-port,id=rp0,chassis=1 -device e1000e,bus=rp0 -device e1000e' ;; \
+		*) hardware='' ;; \
 	esac; \
 	log='$(TEST_BUILD_DIR)/$*/serial.log'; \
 	rm -f "$$log"; \
 	set +e; \
 	timeout 15s qemu-system-x86_64 \
-		-machine accel=tcg -m 128M -smp 1 \
+		-machine accel=tcg -m 128M -smp 1 $$hardware \
 		-cdrom '$<' -display none -monitor none -serial stdio \
 		-device isa-debug-exit,iobase=0xf4,iosize=0x04 \
 		-no-reboot >"$$log" 2>&1; result=$$?; \
@@ -188,6 +200,11 @@ qemu-test-%: $(TEST_BUILD_DIR)/%/seneri.iso
 		  ! grep -Fq 'Seneri OS: heap coalesced to one free block' "$$log" || \
 		  ! grep -Fq 'Seneri OS: kernel heap established' "$$log" || \
 		  ! grep -Eq '^Seneri OS: deadline table of [0-9]+ entries on the heap$$' "$$log" || \
+		  ! grep -Eq '^Seneri OS: PCI mechanism 1 online, no window mapped$$' "$$log" || \
+		  ! grep -Eq '^Seneri OS: PCI buses [1-9][0-9]* functions [1-9][0-9]* bridges [0-9]+$$' "$$log" || \
+		  ! grep -Eq '^Seneri OS: PCI 0:0\.0 vendor 0x[0-9A-F]+ device 0x[0-9A-F]+ class 0x0*6\.0x0* ' "$$log" || \
+		  ! grep -Fq 'Seneri OS: PCI configuration space enumerated' "$$log" || \
+		  ! grep -Fq 'Seneri OS: PCI enumeration established' "$$log" || \
 		  ! grep -Fq 'Seneri OS: never triple fault milestone passed' "$$log"; }; then \
 		echo 'normal scenario did not complete the integrated production path'; \
 		cat "$$log"; \
@@ -215,6 +232,15 @@ qemu-test-%: $(TEST_BUILD_DIR)/%/seneri.iso
 			grep -Fq '  vector=14 name=page fault' "$$log" && \
 			grep -Fq '  cr2=0x0000000401000000' "$$log" && \
 			grep -Fq '  page-fault bits: P=0 W=1 U=0 RSVD=0 I=0' "$$log" || \
+				diagnostics_ok=false ;; \
+		pci) \
+			grep -Eq '^ST PCI ports functions [0-9]+ buses [0-9]+$$' "$$log" && \
+			! grep -Fq 'Seneri OS: ACPI MCFG at' "$$log" || \
+				diagnostics_ok=false ;; \
+		pci-ecam) \
+			grep -Fq 'Seneri OS: ACPI MCFG at' "$$log" && \
+			grep -Eq '^ST PCI window agreed on [0-9]+ registers of [0-9]+ functions across [0-9]+ buses, [0-9]+ with MSI-X$$' "$$log" && \
+			! grep -Eq '^ST PCI window agreed on [0-9]+ registers of 0 functions' "$$log" || \
 				diagnostics_ok=false ;; \
 	esac; \
 	if test "$$diagnostics_ok" != true; then \

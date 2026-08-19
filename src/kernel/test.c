@@ -15,6 +15,7 @@
 #include <seneri/ioapic.h>
 #include <seneri/memory.h>
 #include <seneri/paging.h>
+#include <seneri/pci.h>
 #include <seneri/pic.h>
 #include <seneri/pit.h>
 #include <seneri/pm_timer.h>
@@ -204,6 +205,14 @@ static enum kernel_test_scenario scenario_from_value(
         return KERNEL_TEST_HEAP;
     }
 
+    if (token_equals(value, length, "pci")) {
+        return KERNEL_TEST_PCI;
+    }
+
+    if (token_equals(value, length, "pci-ecam")) {
+        return KERNEL_TEST_PCI_ECAM;
+    }
+
     return KERNEL_TEST_INVALID;
 }
 
@@ -246,6 +255,10 @@ static uint8_t scenario_exit_value(enum kernel_test_scenario scenario)
         return UINT8_C(0x20);
     case KERNEL_TEST_HEAP:
         return UINT8_C(0x21);
+    case KERNEL_TEST_PCI:
+        return UINT8_C(0x22);
+    case KERNEL_TEST_PCI_ECAM:
+        return UINT8_C(0x23);
     default:
         return QEMU_FAILURE_VALUE;
     }
@@ -1274,7 +1287,7 @@ static void paging_scenario(void)
         kernel_test_fail("a 2 MiB mapping accepted a 4 KiB change");
     }
 
-    if (paging_initialize(&paging_probe_topology) !=
+    if (paging_initialize(&paging_probe_topology, NULL) !=
         PAGING_STATUS_ALREADY_INITIALIZED) {
         kernel_test_fail("page tables accepted a second installation");
     }
@@ -1570,7 +1583,442 @@ static void heap_scenario(void)
     );
 }
 
-void kernel_test_run(enum kernel_test_scenario scenario)
+
+/*
+ * Read every register of every recorded function twice through the ports and
+ * require the two passes to agree. Configuration reads are the foundation
+ * everything above them is decoded from, so a reader that returns a different
+ * answer for the same question makes every claim above it meaningless. This is
+ * the check that would catch an address port left latched by something else.
+ */
+static void pci_reads_repeat(void)
+{
+    for (size_t index = 0; index < pci_function_count(); ++index) {
+        const struct pci_function *function = pci_function_at(index);
+
+        if (function == NULL) {
+            kernel_test_fail("PCI returned no function for a live index");
+        }
+
+        for (uint16_t offset = 0U;
+             offset <= PCI_CONFIG_SPACE_SIZE - 4U;
+             offset = (uint16_t)(offset + 4U)) {
+            uint32_t first = 0U;
+            uint32_t second = 0U;
+
+            if (pci_config_read_port(function->address, offset, &first) !=
+                    PCI_STATUS_OK ||
+                pci_config_read_port(function->address, offset, &second) !=
+                    PCI_STATUS_OK) {
+                kernel_test_fail("a configuration read was refused");
+            }
+
+            if (first != second) {
+                kernel_test_fail("a configuration register did not read twice");
+            }
+        }
+    }
+}
+
+/* Every refusal both readers owe, driven against the live machine. */
+static void pci_refusals_are_named(void)
+{
+    struct pci_address address;
+    uint32_t value = 0U;
+
+    address.segment = 0U;
+    address.bus = 0U;
+    address.device = 0U;
+    address.function = 0U;
+
+    if (pci_config_read_port(address, 2U, &value) != PCI_STATUS_BAD_OFFSET) {
+        kernel_test_fail("an unaligned configuration read was accepted");
+    }
+
+    if (pci_config_read_port(address, PCI_CONFIG_SPACE_SIZE, &value) !=
+        PCI_STATUS_BAD_OFFSET) {
+        kernel_test_fail("a configuration read past the space was accepted");
+    }
+
+    address.device = PCI_DEVICES_PER_BUS;
+
+    if (pci_config_read_port(address, 0U, &value) != PCI_STATUS_BAD_ADDRESS) {
+        kernel_test_fail("a device number out of range was accepted");
+    }
+
+    address.device = 0U;
+    address.segment = 1U;
+
+    if (pci_config_read_port(address, 0U, &value) != PCI_STATUS_BAD_ADDRESS) {
+        kernel_test_fail("the ports accepted a segment they cannot carry");
+    }
+
+    if (pci_initialize(NULL, false) != PCI_STATUS_ALREADY_INITIALIZED) {
+        kernel_test_fail("PCI accepted a second initialization");
+    }
+}
+
+/*
+ * At least one address on bus zero must have nothing at it, and must read all
+ * ones. Absence is how enumeration decides a device is not there, so a machine
+ * where absence read as anything else would produce devices that do not exist -
+ * and this is the only way to check that the floating bus behaves as the
+ * specification says it does.
+ */
+static void pci_absence_reads_all_ones(void)
+{
+    struct pci_address address;
+    bool found_absent = false;
+
+    address.segment = 0U;
+    address.bus = 0U;
+    address.function = 0U;
+
+    for (uint8_t device = 0; device < PCI_DEVICES_PER_BUS; ++device) {
+        uint32_t identity = 0U;
+
+        address.device = device;
+
+        if (pci_config_read_port(address, PCI_REGISTER_VENDOR_ID, &identity) !=
+            PCI_STATUS_OK) {
+            kernel_test_fail("a configuration read was refused");
+        }
+
+        if ((uint16_t)identity != PCI_VENDOR_ABSENT) {
+            continue;
+        }
+
+        found_absent = true;
+
+        /*
+         * Not just the vendor register: an absent function floats the whole
+         * bus high, so every register of it must read all ones. A machine that
+         * answered zero for the rest would let a decoder invent a device with
+         * class zero at every empty slot.
+         */
+        for (uint16_t offset = 0U;
+             offset <= PCI_CONFIG_SPACE_SIZE - 4U;
+             offset = (uint16_t)(offset + 4U)) {
+            uint32_t value = 0U;
+
+            if (pci_config_read_port(address, offset, &value) !=
+                PCI_STATUS_OK) {
+                kernel_test_fail("a configuration read was refused");
+            }
+
+            if (value != UINT32_C(0xFFFFFFFF)) {
+                kernel_test_fail("an absent function did not read all ones");
+            }
+        }
+    }
+
+    if (!found_absent) {
+        kernel_test_fail("bus zero has no empty slot to prove absence with");
+    }
+}
+
+/*
+ * Enumeration through the I/O ports alone, on a machine that declares no
+ * configuration window. This is the path every x86 machine has, so it is the
+ * one that must work without any of the rest, and the scenario asserts the
+ * window really is absent rather than merely unused.
+ */
+static void pci_scenario(const struct acpi_mcfg *mcfg, bool mcfg_present)
+{
+    const struct pci_function *host_bridge;
+    const struct pci_function *network;
+    struct pci_state pci;
+    struct pci_address address;
+    enum pci_status status;
+    uint32_t value = 0U;
+
+    if (!heap_is_active() || !paging_is_active()) {
+        kernel_test_fail("PCI enumeration ran without its lower layers");
+    }
+
+    if (pci_is_initialized()) {
+        kernel_test_fail("PCI was initialized before its scenario");
+    }
+
+    status = pci_initialize(mcfg, mcfg_present);
+
+    if (status != PCI_STATUS_OK) {
+        kernel_test_fail(pci_status_string(status));
+    }
+
+    pci = pci_get_state();
+
+    if (pci.ecam_active) {
+        kernel_test_fail("a configuration window was mapped on this machine");
+    }
+
+    /*
+     * With no window the memory reader has nothing to answer with, and says so
+     * by name rather than reading whatever is at address zero.
+     */
+    address.segment = 0U;
+    address.bus = 0U;
+    address.device = 0U;
+    address.function = 0U;
+
+    if (pci_config_read_ecam(address, 0U, &value) != PCI_STATUS_NO_ECAM) {
+        kernel_test_fail("the window reader answered without a window");
+    }
+
+    if (pci.compared_dwords != 0U || pci.compared_functions != 0U) {
+        kernel_test_fail("a comparison was reported without two mechanisms");
+    }
+
+    if (pci.bus_count == 0U || pci.function_count == 0U) {
+        kernel_test_fail("enumeration through the ports found nothing");
+    }
+
+    host_bridge = pci_find_class(PCI_CLASS_BRIDGE, PCI_SUBCLASS_HOST_BRIDGE);
+
+    if (host_bridge == NULL) {
+        kernel_test_fail("enumeration found no host bridge");
+    }
+
+    if (host_bridge->address.bus != 0U || host_bridge->address.device != 0U ||
+        host_bridge->address.function != 0U) {
+        kernel_test_fail("the host bridge is not at 00:00.0");
+    }
+
+    if (host_bridge->vendor_id == PCI_VENDOR_ABSENT ||
+        host_bridge->vendor_id == 0U) {
+        kernel_test_fail("the host bridge has no vendor");
+    }
+
+    /*
+     * The host bridge is the first function on this machine, so a lookup that
+     * ignored its arguments entirely would still return it and still satisfy
+     * every check above. That was a negative control that passed, so two more
+     * are asked: a class that is present but is not the first function, and a
+     * class that is not assigned at all and must therefore be found nowhere.
+     */
+    network = pci_find_class(PCI_CLASS_NETWORK, 0U);
+
+    if (network == NULL || network->class_code != PCI_CLASS_NETWORK ||
+        network->subclass != 0U || network == host_bridge) {
+        kernel_test_fail("the class lookup did not find the network device");
+    }
+
+    if (pci_find_class(UINT8_C(0xFE), UINT8_C(0xFE)) != NULL) {
+        kernel_test_fail("the class lookup found an unassigned class");
+    }
+
+    pci_absence_reads_all_ones();
+    pci_reads_repeat();
+    pci_refusals_are_named();
+
+    if (pci_verify() != PCI_STATUS_OK) {
+        kernel_test_fail("PCI enumeration no longer matches the machine");
+    }
+
+    console_write("ST PCI ports functions ");
+    console_write_u64(pci.function_count);
+    console_write(" buses ");
+    console_write_u64(pci.bus_count);
+    console_putc('\n');
+
+    if (pci_shutdown() != PCI_STATUS_OK ||
+        pci_shutdown() != PCI_STATUS_NOT_INITIALIZED) {
+        kernel_test_fail("PCI would not release its function table");
+    }
+}
+
+/*
+ * The same machine read two completely different ways.
+ *
+ * The port pair and the mapped window share no code below this file: one is two
+ * I/O instructions, the other a load from uncacheable memory whose address is
+ * computed from a firmware table. They have no reason to agree about anything
+ * unless both are addressing the function the enumeration believes they are, so
+ * requiring them to agree register for register is a check on the bus number
+ * arithmetic, the window's base, the mapping's cacheability and the firmware
+ * description all at once.
+ *
+ * The scenario also requires them to *disagree* about different functions,
+ * because a window reader whose device and function bits went nowhere would
+ * agree with the ports about 00:00.0 and answer 00:00.0 for everything else.
+ */
+static void pci_ecam_scenario(const struct acpi_mcfg *mcfg, bool mcfg_present)
+{
+    struct pci_state pci;
+    struct pci_address address;
+    enum pci_status status;
+    size_t bridges = 0U;
+    size_t message_signalled = 0U;
+    size_t behind_a_bridge = 0U;
+    size_t distinct_identities = 0U;
+    uint32_t first_identity = 0U;
+    uint32_t value = 0U;
+
+    if (!mcfg_present) {
+        kernel_test_fail("this machine declares no configuration window");
+    }
+
+    status = pci_initialize(mcfg, mcfg_present);
+
+    if (status != PCI_STATUS_OK) {
+        kernel_test_fail(pci_status_string(status));
+    }
+
+    pci = pci_get_state();
+
+    if (!pci.ecam_active) {
+        kernel_test_fail("the declared configuration window was not mapped");
+    }
+
+    if (pci.ecam_size != PAGING_ECAM_WINDOW_SIZE ||
+        pci.ecam_base != paging_get_state().ecam_window_base) {
+        kernel_test_fail("the window read is not the window that was mapped");
+    }
+
+    /*
+     * Configuration space read through a cached mapping would be answered from
+     * whatever the line held when it was last filled. QEMU under TCG models no
+     * cache, so a cached window behaves identically here and no behavioural
+     * test can tell the difference - the negative control for it passed with
+     * the mapping made write-back. What can be checked is the mapping itself,
+     * so it is: every page of the window must translate as uncacheable, at 4 KiB
+     * granularity, to the physical address it claims. That is the same move
+     * paging.c makes when it walks its own tables rather than trusting them.
+     */
+    for (uint64_t offset = 0U; offset < pci.ecam_size;
+         offset += PAGING_PAGE_SIZE) {
+        struct paging_translation window;
+
+        if (paging_translate(pci.ecam_base + offset, &window) !=
+            PAGING_STATUS_OK) {
+            kernel_test_fail("a configuration window page is not mapped");
+        }
+
+        if (window.physical_address != pci.ecam_base + offset ||
+            window.level != 1U ||
+            window.permissions != (PAGING_WRITE | PAGING_UNCACHED)) {
+            kernel_test_fail("the configuration window is not device memory");
+        }
+    }
+
+    /*
+     * Every function on this machine sits inside the mapped window, so every
+     * one of them must have been compared. A comparison that quietly skipped
+     * functions would still report agreement.
+     */
+    if (pci.compared_functions != pci.function_count ||
+        pci.compared_dwords !=
+            pci.function_count * (PCI_CONFIG_SPACE_SIZE / 4U) -
+                pci.volatile_dwords) {
+        kernel_test_fail("the two mechanisms were not compared everywhere");
+    }
+
+    for (size_t index = 0; index < pci.function_count; ++index) {
+        const struct pci_function *function = pci_function_at(index);
+        uint32_t identity = 0U;
+
+        if (function == NULL) {
+            kernel_test_fail("PCI returned no function for a live index");
+        }
+
+        if (function->header_type == PCI_HEADER_TYPE_BRIDGE) {
+            ++bridges;
+        }
+
+        if (function->address.bus != 0U) {
+            ++behind_a_bridge;
+        }
+
+        if (function->msi_x_offset != 0U) {
+            ++message_signalled;
+
+            /*
+             * The capability the offset names must actually be there when the
+             * window is asked, not only when the ports were. This is what turns
+             * "a capability was recorded" into "the record points at it".
+             */
+            if (pci_config_read_ecam(
+                    function->address,
+                    function->msi_x_offset,
+                    &value
+                ) != PCI_STATUS_OK ||
+                (uint8_t)value != PCI_CAPABILITY_MSI_X) {
+                kernel_test_fail("a recorded MSI-X capability is not there");
+            }
+        }
+
+        if (pci_config_read_ecam(
+                function->address,
+                PCI_REGISTER_VENDOR_ID,
+                &identity
+            ) != PCI_STATUS_OK) {
+            kernel_test_fail("the window would not read a live function");
+        }
+
+        if (index == 0U) {
+            first_identity = identity;
+        } else if (identity != first_identity) {
+            ++distinct_identities;
+        }
+    }
+
+    /*
+     * A window reader that ignored the device and function bits would answer
+     * the same identity for every function and still agree with the ports about
+     * the first one. Requiring the answers to differ is what closes that.
+     */
+    if (distinct_identities == 0U) {
+        kernel_test_fail("the window answered one identity for every function");
+    }
+
+    if (bridges == 0U || behind_a_bridge == 0U || pci.bus_count < 2U) {
+        kernel_test_fail("enumeration did not cross a bridge");
+    }
+
+    if (message_signalled == 0U) {
+        kernel_test_fail("no function offered message-signalled interrupts");
+    }
+
+    /*
+     * A bus past what Seneri mapped is refused rather than folded back into the
+     * window, which is the failure that would read one bus as another.
+     */
+    address.segment = 0U;
+    address.bus = (uint8_t)(pci.ecam_end_bus + 1U);
+    address.device = 0U;
+    address.function = 0U;
+
+    if (pci_config_read_ecam(address, 0U, &value) !=
+        PCI_STATUS_OUTSIDE_ECAM_WINDOW) {
+        kernel_test_fail("the window answered about a bus it does not map");
+    }
+
+    pci_reads_repeat();
+
+    if (pci_verify() != PCI_STATUS_OK) {
+        kernel_test_fail("PCI enumeration no longer matches the machine");
+    }
+
+    console_write("ST PCI window agreed on ");
+    console_write_u64(pci.compared_dwords);
+    console_write(" registers of ");
+    console_write_u64(pci.compared_functions);
+    console_write(" functions across ");
+    console_write_u64(pci.bus_count);
+    console_write(" buses, ");
+    console_write_u64(message_signalled);
+    console_write(" with MSI-X\n");
+
+    if (pci_shutdown() != PCI_STATUS_OK) {
+        kernel_test_fail("PCI would not release its function table");
+    }
+}
+
+void kernel_test_run(
+    enum kernel_test_scenario scenario,
+    const struct acpi_mcfg *mcfg,
+    bool mcfg_present
+)
 {
     enum pit_status pit_status;
 
@@ -1658,6 +2106,12 @@ void kernel_test_run(enum kernel_test_scenario scenario)
     case KERNEL_TEST_HEAP:
         heap_scenario();
         kernel_test_fail("a heap guard page accepted a supervisor write");
+    case KERNEL_TEST_PCI:
+        pci_scenario(mcfg, mcfg_present);
+        kernel_test_pass();
+    case KERNEL_TEST_PCI_ECAM:
+        pci_ecam_scenario(mcfg, mcfg_present);
+        kernel_test_pass();
     case KERNEL_TEST_DOUBLE_FAULT:
         kernel_test_double_fault_armed = 1U;
         interrupt_test_set_gate_present(14U, false);
@@ -1766,6 +2220,10 @@ const char *kernel_test_scenario_name(enum kernel_test_scenario scenario)
         return "paging";
     case KERNEL_TEST_HEAP:
         return "heap";
+    case KERNEL_TEST_PCI:
+        return "pci";
+    case KERNEL_TEST_PCI_ECAM:
+        return "pci-ecam";
     case KERNEL_TEST_INVALID:
         return "invalid";
     default:

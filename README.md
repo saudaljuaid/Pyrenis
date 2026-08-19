@@ -70,6 +70,8 @@ Seneri OS: kernel heap online
 Seneri OS: heap coalesced to one free block
 Seneri OS: kernel heap established
 Seneri OS: deadline table of 32 entries on the heap
+Seneri OS: PCI configuration space enumerated
+Seneri OS: PCI enumeration established
 ```
 
 ## Build and prove it
@@ -85,7 +87,7 @@ Then run:
 ```sh
 make verify   # clean build plus ELF, Multiboot2, symbol, and W^X checks
 make smoke      # run the strict normal-boot QEMU protocol
-make qemu-tests # run eighteen deterministic fault and interrupt scenarios
+make qemu-tests # run twenty deterministic fault, interrupt and device scenarios
 make run      # optional interactive boot
 make hooks    # enforce verification in this local clone
 ```
@@ -113,6 +115,7 @@ make hooks    # enforce verification in this local clone
 - `src/kernel/timer.c` — deadline timers on the APIC timer's one-shot mode.
 - `src/kernel/paging.c` — the kernel's own page tables and the W^X guarantee.
 - `src/kernel/heap.c` — the guarded, bounded, transactional kernel heap.
+- `src/kernel/pci.c` — PCI configuration space, read two independent ways.
 - `linker.ld` — low-memory ELF layout with separate, page-aligned R, RX, and RW
   segments.
 - `docs/ACPI_TABLES.md` — firmware-table bounds, invariants, and test protocol.
@@ -127,6 +130,10 @@ make hooks    # enforce verification in this local clone
 - `docs/MONOTONIC_TIME.md` — an instant, a deadline, and how bounded a sleep is.
 - `docs/VIRTUAL_MEMORY.md` — owning the tables, and making W^X true on the metal.
 - `docs/KERNEL_HEAP.md` — the first allocator that is not a fixed array.
+- `docs/PCI_ENUMERATION.md` — counting the machine, and two readers checking each
+  other.
+- `docs/HARDWARE_AND_APPLICATIONS.md` — the costed route to drivers, wireless,
+  and running programs.
 - `docs/NEVER_TRIPLE_FAULT.md` — interrupt ABI, invariants, and test protocol.
 - `CONTRIBUTING.md` — non-negotiable engineering and commit rules.
 
@@ -163,6 +170,21 @@ be contiguous. Its metadata lives outside the memory it manages, so an overrun
 cannot corrupt the allocator, and the `heap` scenario proves the guard by
 walking off the end and taking the fault.
 
+Above the heap, Seneri now knows what is actually plugged into the machine. It
+reads the MCFG table firmware publishes, carves the configuration window it names
+out of the identity map as uncacheable device memory, and enumerates every bus
+reachable from bus zero — following bridges rather than sweeping 256 buses,
+refusing a capability list that loops, and recording what each function is and
+whether it can raise a message-signalled interrupt. Every access is a read, so
+counting the machine cannot disturb it.
+
+Configuration space is reachable two entirely different ways, so both are
+implemented and each is made to check the other: enumeration runs on the I/O
+ports every PC has, and the memory window is then required to agree with them
+register for register on every function inside it. The same argument the three
+clocks make, one layer up. A machine that declares no window — the default QEMU
+machine is one — is not a failure; it runs on the ports alone and says so.
+
 What is missing sits above that layer. The heap has its first consumer — the
 deadline table is obtained from it at `timer_start` and returned at
 `timer_stop` — but the ACPI topology and the interrupt tables are still fixed
@@ -175,12 +197,18 @@ higher-half, a 4 KiB change inside a 2 MiB mapping is refused rather than split,
 and the page-fault handler stays fatal: there is no demand paging. There is no
 wall-clock date, only time since boot. The supported target still reports no
 invariant counter, so the TSC's rate being correct is not the same as its rate
-being stable. Level-triggered I/O APIC routing still needs directed EOI, which
-gates PCI device interrupts. Everything here is verified under QEMU; the
+being stable. Level-triggered I/O APIC routing still needs directed EOI,
+which gates legacy device interrupts — though the enumeration above found that
+every PCI Express endpoint on the tested machines offers message-signalled
+interrupts, which are a memory write to the local APIC and so are edge-triggered
+by construction, so that gap is no longer on the road to device drivers. Everything here is verified under QEMU; the
 uncacheable APIC mappings in particular are the kind of change that fails only
-on real hardware. It has a deliberately narrow single-core foundation, but no
-heap, scheduler, userspace, filesystem, networking, graphics, or general
-hardware drivers. Those arrive only after the previous layer has an executable
+on real hardware. No base address register is sized and no device is claimed, so the
+enumeration is a list rather than a driver; `docs/HARDWARE_AND_APPLICATIONS.md`
+costs the route from that list to storage, wireless, and running programs, and
+records why Linux driver source is not on it. It has a deliberately narrow
+single-core foundation, but no scheduler, userspace, filesystem, networking,
+graphics, or hardware drivers. Those arrive only after the previous layer has an executable
 acceptance test.
 
 Seneri OS is licensed under GPL-3.0; see `LICENSE`.
