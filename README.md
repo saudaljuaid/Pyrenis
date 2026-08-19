@@ -74,6 +74,7 @@ Seneri OS: PCI configuration space enumerated
 Seneri OS: PCI enumeration established
 Seneri OS: kernel threads established
 Seneri OS: framebuffer established
+Seneri OS: logo established
 ```
 
 ## Build and prove it
@@ -82,7 +83,13 @@ On Ubuntu 24.04 or a compatible Debian-based environment, install:
 
 ```sh
 sudo apt-get install binutils gcc grub-common grub-pc-bin make mtools qemu-system-x86 xorriso
+rustup target add x86_64-unknown-none
 ```
+
+Most of Seneri is C11 and GNU assembly. One component is Rust: the boot logo
+decoder, which reads a byte stream the kernel did not produce.
+`docs/RUST.md` states where that line goes and why it is not where it is usually
+put.
 
 Then run:
 
@@ -121,6 +128,8 @@ make hooks    # enforce verification in this local clone
 - `src/kernel/thread.c` — kernel threads, guarded stacks, and the run queue.
 - `src/arch/x86_64/thread.S` — the context switch and where a new thread starts.
 - `src/kernel/framebuffer.c` — every pixel on the screen, and proof of each one.
+- `src/rust/logo.rs` — the boot logo decoder, in Rust, and its refusals.
+- `tools/make-logo-asset.py` — turns the logo into what the kernel can decode.
 - `linker.ld` — low-memory ELF layout with separate, page-aligned R, RX, and RW
   segments.
 - `docs/ACPI_TABLES.md` — firmware-table bounds, invariants, and test protocol.
@@ -141,6 +150,7 @@ make hooks    # enforce verification in this local clone
   and running programs.
 - `docs/THREADS.md` — more than one thread of control, and the page below each.
 - `docs/FRAMEBUFFER.md` — pixels, and why a picture is not proof of one.
+- `docs/RUST.md` — the one component that is not C, and where that line goes.
 - `docs/NEVER_TRIPLE_FAULT.md` — interrupt ABI, invariants, and test protocol.
 - `CONTRIBUTING.md` — non-negotiable engineering and commit rules.
 
@@ -233,7 +243,10 @@ uncacheable APIC mappings in particular are the kind of change that fails only
 on real hardware. No base address register is sized and no device is claimed, so the
 enumeration is a list rather than a driver; `docs/HARDWARE_AND_APPLICATIONS.md`
 costs the route from that list to storage, wireless, and running programs, and
-records why Linux driver source is not on it. There is no text on that screen: nothing yet knows what a character is, and the
+records why Linux driver source is not on it. The logo is on that screen at boot, decoded from a run-length image by the one
+Rust component in the kernel and blitted by C, with all 65,536 of its pixels
+read back off the framebuffer and compared against the decode before boot
+continues. There is still no text: nothing yet knows what a character is, and the
 framebuffer is uncacheable rather than write-combining, so every store to it is
 a bus cycle. A thread that overflows its stack is contained by
 its guard page and the double-fault stack, but cannot yet be diagnosed as an

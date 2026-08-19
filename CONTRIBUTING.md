@@ -18,7 +18,14 @@ merge an unreviewed kernel change.
 
 ## Code standard
 
-- The implementation languages are C11 and GNU assembly for the selected target.
+- The implementation languages are C11, GNU assembly, and Rust 2024 for the
+  selected target. Rust is not a general alternative to C here: it is for
+  decoding byte streams this kernel did not produce, and `docs/RUST.md` states
+  the rule and the reasoning. Code that talks to hardware stays in C, because
+  every such operation is `unsafe` in either language.
+- Rust warnings are errors, `unsafe_op_in_unsafe_fn` is denied, and every
+  `unsafe` block carries a comment naming the condition that makes it sound.
+  A new `unsafe` block outside `src/rust/abi.rs` needs a written justification.
 - The kernel is freestanding: no host libc, hosted assumptions, or hidden runtime.
 - Compiler and assembler warnings are errors. Suppression requires a written
   reason in the same change and must be narrower than the warning it addresses.

@@ -13,6 +13,7 @@
 #include <seneri/framebuffer.h>
 #include <seneri/heap.h>
 #include <seneri/interrupts.h>
+#include <seneri/logo.h>
 #include <seneri/ioapic.h>
 #include <seneri/memory.h>
 #include <seneri/paging.h>
@@ -59,6 +60,15 @@
 #define THREAD_PROOF_THREADS 3U
 #define THREAD_PROOF_ROUNDS 4U
 #define THREAD_PROOF_LOG (THREAD_PROOF_THREADS * THREAD_PROOF_ROUNDS)
+
+/*
+ * What the screen is cleared to before the logo is drawn: a near-black with a
+ * slight blue bias, so the logo's own edges have something to sit against
+ * rather than a pure black that hides how they were composited.
+ */
+#define BOOT_BACKGROUND_RED UINT8_C(0x08)
+#define BOOT_BACKGROUND_GREEN UINT8_C(0x0A)
+#define BOOT_BACKGROUND_BLUE UINT8_C(0x0E)
 
 _Noreturn void kernel_main(uint32_t magic, uintptr_t boot_information);
 
@@ -1456,6 +1466,156 @@ static void prove_framebuffer(const struct boot_framebuffer *framebuffer)
     console_write("Seneri OS: framebuffer established\n");
 }
 
+/*
+ * Draw the logo, and prove it arrived.
+ *
+ * The decoder is Rust; docs/RUST.md argues why that one file is. From here it
+ * is an ordinary subsystem with ordinary refusals, and the proof is the same
+ * shape as every other: the image is decoded into memory, blitted, and then
+ * every pixel of the blitted region is read back off the screen and compared
+ * against what the decoder produced. A logo that looks right is not evidence;
+ * a logo whose 65,536 pixels each match the decode is.
+ */
+static void draw_logo(void)
+{
+    struct framebuffer_state screen = framebuffer_get_state();
+    const uint32_t background = framebuffer_pack(
+        BOOT_BACKGROUND_RED,
+        BOOT_BACKGROUND_GREEN,
+        BOOT_BACKGROUND_BLUE
+    );
+    const uint32_t mask = framebuffer_visible_mask();
+    uint32_t *decoded = NULL;
+    void *allocation = NULL;
+    uint32_t width = 0U;
+    uint32_t height = 0U;
+    uint32_t origin_x;
+    uint32_t origin_y;
+    uint64_t compared = 0U;
+    int32_t status = seneri_logo_geometry(&width, &height);
+
+    if (status != LOGO_STATUS_OK) {
+        console_panic(logo_status_string(status));
+    }
+
+    console_write("Seneri OS: logo ");
+    console_write_u64(width);
+    console_putc('x');
+    console_write_u64(height);
+    console_write(" from ");
+    console_write_u64(seneri_logo_size());
+    console_write(" bytes, decoded by Rust\n");
+
+    if (width > screen.width || height > screen.height) {
+        console_panic("the logo does not fit the screen");
+    }
+
+    /*
+     * One heap allocation for the decoded image, released before this returns.
+     * The decoder is handed a buffer of exactly the pixels it declared, so a
+     * decode that filled less than the whole image cannot be mistaken for one
+     * that filled all of it.
+     */
+    if (heap_allocate((uint64_t)width * height * sizeof(uint32_t),
+            &allocation) != HEAP_STATUS_OK) {
+        console_panic("no memory for the decoded logo");
+    }
+
+    decoded = (uint32_t *)allocation;
+
+    /*
+     * A buffer one pixel short must be refused. Checked here rather than only
+     * in the decoder's own tests, because this is the call site whose length
+     * argument would be wrong if anything upstream of it were.
+     */
+    if (seneri_logo_decode(decoded, (size_t)((uint64_t)width * height - 1U),
+            screen.red_position, screen.green_position, screen.blue_position,
+            background) != LOGO_STATUS_BUFFER_TOO_SMALL) {
+        console_panic("the logo decoder accepted a short buffer");
+    }
+
+    if (seneri_logo_decode(NULL, (size_t)((uint64_t)width * height),
+            screen.red_position, screen.green_position, screen.blue_position,
+            background) != LOGO_STATUS_NULL_ARGUMENT) {
+        console_panic("the logo decoder accepted a null buffer");
+    }
+
+    status = seneri_logo_decode(decoded, (size_t)((uint64_t)width * height),
+        screen.red_position, screen.green_position, screen.blue_position,
+        background);
+
+    if (status != LOGO_STATUS_OK) {
+        console_panic(logo_status_string(status));
+    }
+
+    if (framebuffer_fill(background) != FRAMEBUFFER_STATUS_OK) {
+        console_panic("the framebuffer would not clear");
+    }
+
+    origin_x = (screen.width - width) / 2U;
+    origin_y = (screen.height - height) / 2U;
+
+    for (uint32_t y = 0; y < height; ++y) {
+        for (uint32_t x = 0; x < width; ++x) {
+            if (framebuffer_write_pixel(origin_x + x, origin_y + y,
+                    decoded[(uint64_t)y * width + x]) !=
+                FRAMEBUFFER_STATUS_OK) {
+                console_panic("the logo did not fit where it was drawn");
+            }
+        }
+    }
+
+    /*
+     * Read the whole logo back off the screen. This is what makes the claim
+     * "the logo is on the screen" mean something a serial line can carry.
+     */
+    for (uint32_t y = 0; y < height; ++y) {
+        for (uint32_t x = 0; x < width; ++x) {
+            uint32_t pixel = 0U;
+
+            if (framebuffer_read_pixel(origin_x + x, origin_y + y, &pixel) !=
+                FRAMEBUFFER_STATUS_OK) {
+                console_panic("the logo did not fit where it was drawn");
+            }
+
+            if ((pixel & mask) !=
+                (decoded[(uint64_t)y * width + x] & mask)) {
+                console_panic("a logo pixel did not reach the screen");
+            }
+
+            ++compared;
+        }
+    }
+
+    /*
+     * The pixel just outside the logo must still be the background. A blit
+     * that ran one row or column long would otherwise be invisible.
+     */
+    if (origin_x > 0U) {
+        uint32_t edge = 0U;
+
+        if (framebuffer_read_pixel(origin_x - 1U, origin_y, &edge) !=
+                FRAMEBUFFER_STATUS_OK ||
+            (edge & mask) != (background & mask)) {
+            console_panic("the logo was drawn outside its own area");
+        }
+    }
+
+    if (heap_free(allocation) != HEAP_STATUS_OK) {
+        console_panic("the decoded logo could not be released");
+    }
+
+    console_write("Seneri OS: logo verified ");
+    console_write_u64(compared);
+    console_write(" pixels on screen\n");
+
+    if (compared != (uint64_t)width * height) {
+        console_panic("the logo proof skipped part of the image");
+    }
+
+    console_write("Seneri OS: logo established\n");
+}
+
 static void prove_frame_lifecycle(void)
 {
     uintptr_t first_frame;
@@ -1614,6 +1774,14 @@ _Noreturn void kernel_main(uint32_t magic, uintptr_t boot_information)
         console_panic("framebuffer geometry self-test failed");
     }
 
+    /*
+     * The first self-test in this kernel that is not C. It runs beside the
+     * others because a caller should not have to care which language answered.
+     */
+    if (seneri_logo_self_test() != 1) {
+        console_panic("logo decoder self-test failed");
+    }
+
     console_write("Seneri OS: parser rejection tests passed\n");
 
     boot_status = boot_context_parse(magic, boot_information, &context);
@@ -1765,6 +1933,10 @@ _Noreturn void kernel_main(uint32_t magic, uintptr_t boot_information)
     prove_threads();
     prove_framebuffer(&context.framebuffer);
 
+    if (framebuffer_is_active()) {
+        draw_logo();
+    }
+
     /*
      * Re-walk the installed hierarchy at the end of boot. Everything between
      * the switch and here ran on it, including three subsystems that write
@@ -1807,6 +1979,7 @@ _Noreturn void kernel_main(uint32_t magic, uintptr_t boot_information)
     console_write("Seneri OS: PCI enumeration established\n");
     console_write("Seneri OS: kernel threads passed\n");
     console_write("Seneri OS: framebuffer passed\n");
+    console_write("Seneri OS: logo passed\n");
     console_write("Seneri OS: never triple fault milestone passed\n");
 
     if (test_scenario == KERNEL_TEST_NORMAL) {

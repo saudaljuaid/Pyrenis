@@ -45,6 +45,26 @@ SECTIONS
     {
         __rodata_start = .;
         *(.rodata .rodata.*)
+        /*
+         * Rust emits constants that would need relocating in a position
+         * independent image here. This kernel is linked at a fixed address, so
+         * they are fixed at link time and belong with the other constants -
+         * read-only, and never in the writable segment.
+         */
+        *(.data.rel.ro .data.rel.ro.*)
+
+        /*
+         * A freestanding kernel linked at a fixed address has no business
+         * owning a global offset table or a procedure linkage table. They are
+         * named here rather than left as orphans so the linker cannot place
+         * them somewhere of its choosing, and asserted empty below so that if
+         * anything ever does need one, the build says so instead of quietly
+         * growing an indirection layer nothing initialises.
+         */
+        __got_start = .;
+        *(.got .got.plt .igot.plt)
+        *(.plt .plt.* .iplt)
+        __got_end = .;
         . = ALIGN(4K);
         __rodata_end = .;
     } :rodata
@@ -68,12 +88,48 @@ SECTIONS
 
     __kernel_end = .;
 
+    /*
+     * Everything the toolchains emit that this kernel does not run. The LLVM
+     * bitcode and command sections arrive with the Rust static library and are
+     * build metadata rather than code; keeping them would put megabytes of it
+     * in the image and, worse, leave it to the linker to decide where.
+     */
     /DISCARD/ :
     {
         *(.comment)
         *(.eh_frame .eh_frame.*)
         *(.note .note.*)
+        *(.llvmbc)
+        *(.llvmcmd)
+
+        /*
+         * Relocations for a fully linked, non-relocatable image. Discarding
+         * them is safe only because the GOT assertion below proves nothing
+         * needed relocating.
+         */
+        *(.rela .rela.*)
     }
+
+    /*
+     * Debug information, kept but never loaded. Named explicitly because
+     * --orphan-handling=error refuses anything this script does not mention,
+     * and losing line numbers to keep the linker honest is a bad trade.
+     */
+    .debug_abbrev 0 : { *(.debug_abbrev) }
+    .debug_aranges 0 : { *(.debug_aranges) }
+    .debug_frame 0 : { *(.debug_frame) }
+    .debug_info 0 : { *(.debug_info) }
+    .debug_line 0 : { *(.debug_line) }
+    .debug_line_str 0 : { *(.debug_line_str) }
+    .debug_loc 0 : { *(.debug_loc) }
+    .debug_loclists 0 : { *(.debug_loclists) }
+    .debug_macro 0 : { *(.debug_macro) }
+    .debug_ranges 0 : { *(.debug_ranges) }
+    .debug_rnglists 0 : { *(.debug_rnglists) }
+    .debug_str 0 : { *(.debug_str) }
+    .debug_str_offsets 0 : { *(.debug_str_offsets) }
+    .debug_pubnames 0 : { *(.debug_pubnames) }
+    .debug_pubtypes 0 : { *(.debug_pubtypes) }
 
     ASSERT(__multiboot_header_end - __multiboot_header_start >= 24,
            "Multiboot2 header is incomplete")
@@ -100,6 +156,8 @@ SECTIONS
     ASSERT(__rodata_end == __data_start, "a gap separates rodata and data")
     ASSERT(__data_end == __bss_start, "a gap separates kernel data and bss")
     ASSERT(__bss_end == __kernel_end, "kernel bss does not end the image")
+    ASSERT(__got_end == __got_start,
+           "the kernel gained a global offset table")
 
     /*
      * paging.c gives the 2 MiB regions holding this image 4 KiB granularity and

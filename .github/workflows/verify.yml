@@ -26,6 +26,8 @@ jobs:
                   sudo apt-get update
                   sudo apt-get install --yes --no-install-recommends \
                       binutils gcc grub-common grub-pc-bin make mtools qemu-system-x86 xorriso
+            - name: Install the Rust bare-metal target
+              run: rustup target add x86_64-unknown-none
             - name: Verify the kernel artifact
               run: make verify
             - name: Prove faults and interrupts in QEMU

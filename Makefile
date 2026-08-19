@@ -15,6 +15,17 @@ CC := gcc
 LD := ld
 NM := nm
 OBJDUMP := objdump
+RUSTC := rustc
+PYTHON := python3
+
+# The one target Rust is built for. It matches the C flags exactly - no MMX, no
+# SSE, soft float, no red zone - which is why the two halves can share a stack.
+RUST_TARGET := x86_64-unknown-none
+RUST_LIB := $(BUILD_DIR)/libseneri.a
+RUST_SOURCES := $(wildcard src/rust/*.rs)
+LOGO_SOURCE := assets/seneri-logo.png
+LOGO_BLOB := $(BUILD_DIR)/logo.srl
+LOGO_SIZE := 256
 
 CPPFLAGS := -Iinclude
 COMMON_FLAGS := -m64 -g -ffreestanding -fno-pie -fno-stack-protector
@@ -23,14 +34,26 @@ CFLAGS := $(COMMON_FLAGS) -std=c11 -O2 -mno-red-zone -mno-mmx -mno-sse \
 	-fno-unwind-tables -Wall -Wextra -Werror -Wpedantic -Wshadow -Wundef \
 	-Wstrict-prototypes -Wmissing-prototypes
 ASFLAGS := $(COMMON_FLAGS) -Wa,--fatal-warnings
+# --orphan-handling=error is what keeps the two languages honest. A section
+# neither linker.ld names nor discards is otherwise placed wherever ld prefers,
+# which is how a Rust static library silently opened a gap between data and bss
+# the first time one was linked in. Now an unnamed section is a link error.
 LDFLAGS := -nostdlib -z max-page-size=0x1000 -z noexecstack --fatal-warnings \
-	--build-id=none -T linker.ld -Map=$(BUILD_DIR)/seneri.map
+	--orphan-handling=error --build-id=none -T linker.ld \
+	-Map=$(BUILD_DIR)/seneri.map
 
 C_SOURCES := $(wildcard src/kernel/*.c)
 C_OBJECTS := $(patsubst src/kernel/%.c,$(BUILD_DIR)/%.o,$(C_SOURCES))
 ASM_SOURCES := $(wildcard src/arch/x86_64/*.S)
 ASM_OBJECTS := $(patsubst src/arch/x86_64/%.S,$(BUILD_DIR)/arch_%.o,$(ASM_SOURCES))
 OBJECTS := $(ASM_OBJECTS) $(C_OBJECTS)
+
+# Warnings are errors on both sides of the language boundary, and Rust is held
+# to the stricter rule that an unsafe operation inside an unsafe function still
+# needs its own unsafe block naming why it is sound.
+RUSTFLAGS := --edition 2024 --target $(RUST_TARGET) --crate-type staticlib \
+	--crate-name seneri -C panic=abort -C opt-level=2 \
+	-C relocation-model=static -D warnings
 DEPENDENCIES := $(C_OBJECTS:.o=.d)
 
 # The qemu-test-% scenarios are deliberately absent from .PHONY. GNU Make skips
@@ -52,13 +75,26 @@ $(BUILD_DIR)/arch_%.o: src/arch/x86_64/%.S | $(BUILD_DIR)
 $(BUILD_DIR)/%.o: src/kernel/%.c | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -MMD -MP -c $< -o $@
 
-$(KERNEL): $(OBJECTS) linker.ld
-	$(LD) $(LDFLAGS) -o $@ $(OBJECTS)
+# Regenerated only when the logo itself changes. The result is a build
+# artifact and is deliberately not committed; src/rust/abi.rs includes it.
+$(LOGO_BLOB): $(LOGO_SOURCE) tools/make-logo-asset.py | $(BUILD_DIR)
+	$(PYTHON) tools/make-logo-asset.py $(LOGO_SOURCE) $(LOGO_SIZE) $@
+
+$(RUST_LIB): $(RUST_SOURCES) $(LOGO_BLOB) | $(BUILD_DIR)
+	SENERI_LOGO_BLOB='$(CURDIR)/$(LOGO_BLOB)' \
+		$(RUSTC) $(RUSTFLAGS) -o $@ src/rust/lib.rs
+
+$(KERNEL): $(OBJECTS) $(RUST_LIB) linker.ld
+	$(LD) $(LDFLAGS) -o $@ $(OBJECTS) $(RUST_LIB)
 
 toolchain:
-	@for tool in gcc ld grub-file readelf nm objdump; do \
+	@for tool in gcc ld grub-file readelf nm objdump rustc python3; do \
 		command -v $$tool >/dev/null 2>&1 || { echo "missing tool: $$tool"; exit 1; }; \
 	done
+	@$(RUSTC) --print target-list | grep -Fxq '$(RUST_TARGET)' || \
+		{ echo 'rustc does not know $(RUST_TARGET)'; exit 1; }
+	@$(RUSTC) --target $(RUST_TARGET) --print target-libdir >/dev/null 2>&1 || \
+		{ echo 'run: rustup target add $(RUST_TARGET)'; exit 1; }
 
 lint:
 	@if git grep -nI -E '[[:blank:]]+$$' -- . ':!assets/*'; then \
@@ -88,6 +124,10 @@ verify: toolchain lint
 	@$(NM) $(KERNEL) | grep -Eq ' [ABDRTt] __text_start$$'
 	@$(NM) $(KERNEL) | grep -Eq ' [ABDRTt] __rodata_start$$'
 	@$(NM) $(KERNEL) | grep -Eq ' [ABDRTt] __data_start$$'
+	# The Rust half has to actually be in the image, and has to have been
+	# linked as ordinary code rather than as something with its own runtime.
+	@$(NM) $(KERNEL) | grep -Eq ' T seneri_logo_decode$$'
+	@$(NM) $(KERNEL) | grep -Eq ' T seneri_logo_self_test$$'
 
 $(ISO): $(KERNEL) grub/grub.cfg
 	mkdir -p $(ISO_ROOT)/boot/grub
