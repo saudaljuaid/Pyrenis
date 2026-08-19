@@ -4,7 +4,9 @@
 #include <stdint.h>
 
 #include <seneri/framebuffer.h>
+#include <seneri/cpu.h>
 #include <seneri/heap.h>
+#include <seneri/paging.h>
 #include <seneri/surface.h>
 
 /*
@@ -506,6 +508,13 @@ enum surface_status surface_present(struct surface *surface)
         }
     }
 
+    /*
+     * WC stores are weakly ordered. Completion counters and damage state may
+     * only become observable after SFENCE has drained the framebuffer batch;
+     * the same boundary also makes an immediate framebuffer readback valid.
+     */
+    cpu_store_fence();
+
     surface->presents += 1U;
     surface->last_present_pixels = copied;
     surface->presented_pixels += copied;
@@ -554,6 +563,17 @@ enum surface_status surface_verify(const struct surface *surface)
         address > heap.base_address + heap.committed_bytes ||
         size > heap.base_address + heap.committed_bytes - address) {
         return SURFACE_STATUS_VALIDATION_FAILURE;
+    }
+
+    for (uint64_t page = address & ~(PAGING_PAGE_SIZE - 1U);
+         page < address + size; page += PAGING_PAGE_SIZE) {
+        struct paging_translation translation;
+
+        if (paging_translate(page, &translation) != PAGING_STATUS_OK ||
+            translation.permissions != PAGING_WRITE ||
+            translation.memory_type != PAGING_MEMORY_WRITE_BACK) {
+            return SURFACE_STATUS_VALIDATION_FAILURE;
+        }
     }
 
     return SURFACE_STATUS_OK;

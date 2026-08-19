@@ -41,7 +41,8 @@ static bool inside(uint32_t x, uint32_t y)
  * Volatile because these are stores to device memory whose effect the compiler
  * cannot see: nothing in this kernel ever reads most of the framebuffer back,
  * so a non-volatile write loop is dead code the optimiser is entitled to
- * delete. The window is mapped uncacheable, so each of these is a bus cycle.
+ * delete. The window is write-combining: stores may gather in processor buffers
+ * until the caller ends a batch with cpu_store_fence().
  */
 static volatile uint32_t *pixel_at(uint32_t x, uint32_t y)
 {
@@ -264,9 +265,9 @@ enum framebuffer_status framebuffer_verify(void)
     }
 
     /*
-     * Every page of the picture, not a sample: a framebuffer that is device
-     * memory for its first region and write-back for its second would draw
-     * correctly and be wrong.
+     * Every page of the picture, not a sample: a framebuffer that is
+     * write-combining for its first region and write-back for its second could
+     * draw correctly in one mode and still be wrong.
      */
     for (uint64_t address = state.address & ~(PAGING_PAGE_SIZE - 1U);
          address <= last;
@@ -279,7 +280,9 @@ enum framebuffer_status framebuffer_verify(void)
 
         if (translation.physical_address != address ||
             translation.level != 1U ||
-            translation.permissions != (PAGING_WRITE | PAGING_UNCACHED)) {
+            translation.permissions !=
+                (PAGING_WRITE | PAGING_WRITE_COMBINING) ||
+            translation.memory_type != PAGING_MEMORY_WRITE_COMBINING) {
             return FRAMEBUFFER_STATUS_VALIDATION_FAILURE;
         }
     }

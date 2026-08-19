@@ -129,6 +129,31 @@ cpu_read_tsc:
     ret
 .size cpu_read_tsc, . - cpu_read_tsc
 
+/*
+ * Intel SDM volume 3A section 11.3 and AMD APM volume 1 section 7.4.2:
+ * SFENCE orders every older store before every younger store. In particular it
+ * drains the weakly ordered write-combining stores before a caller publishes
+ * completion or performs framebuffer readback.
+ */
+.global cpu_store_fence
+.type cpu_store_fence, @function
+cpu_store_fence:
+    sfence
+    ret
+.size cpu_store_fence, . - cpu_store_fence
+
+/*
+ * WBINVD writes back modified cache lines and invalidates internal caches. The
+ * paging switch uses it with interrupts disabled on both sides of replacing
+ * the bootstrap mapping that described framebuffer addresses as write-back.
+ */
+.global cpu_write_back_and_invalidate_cache
+.type cpu_write_back_and_invalidate_cache, @function
+cpu_write_back_and_invalidate_cache:
+    wbinvd
+    ret
+.size cpu_write_back_and_invalidate_cache, . - cpu_write_back_and_invalidate_cache
+
 /* uint64_t cpu_read_msr(uint32_t msr) - RDMSR returns EDX:EAX. */
 .global cpu_read_msr
 .type cpu_read_msr, @function

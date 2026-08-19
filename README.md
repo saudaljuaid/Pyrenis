@@ -34,7 +34,8 @@ rather than measured — retires the 8254 and proves all three clocks still agre
 about an interval with it gone, establishes a monotonic clock and deadline
 timers and sleeps on one, then builds and installs its own four-level page
 tables — read-only executable text, read-only rodata, writable non-executable
-data, uncacheable APIC registers, an absent null page — walks them in software
+data, uncacheable APIC registers, a write-combining framebuffer, an absent null
+page — establishes and reads back its PAT layout, walks the mappings in software
 to prove no page is both writable and executable, takes a page fault
 deliberately to prove the hardware agrees, and finally opens a guarded, bounded
 kernel heap on that address space, growing it a page at a time and proving the
@@ -65,6 +66,8 @@ Seneri OS: deadline timers online
 Seneri OS: monotonic time established
 Seneri OS: kernel page tables installed
 Seneri OS: no writable executable mapping
+Seneri OS: framebuffer memory type write-combining pages 768
+Seneri OS: write-combining established
 Seneri OS: virtual memory established
 Seneri OS: kernel heap online
 Seneri OS: heap coalesced to one free block
@@ -97,7 +100,7 @@ Then run:
 ```sh
 make verify   # clean build plus ELF, Multiboot2, symbol, and W^X checks
 make smoke      # run the strict normal-boot QEMU protocol
-make qemu-tests # run twenty-seven deterministic fault, device and thread scenarios
+make qemu-tests # run twenty-eight deterministic fault, device and thread scenarios
 make run      # optional interactive boot
 make hooks    # enforce verification in this local clone
 ```
@@ -123,7 +126,7 @@ make hooks    # enforce verification in this local clone
 - `src/kernel/pm_timer.c` — ACPI PM timer, wrap folding, and bounded waiting.
 - `src/kernel/clock.c` — the monotonic clock and its one origin.
 - `src/kernel/timer.c` — deadline timers on the APIC timer's one-shot mode.
-- `src/kernel/paging.c` — the kernel's own page tables and the W^X guarantee.
+- `src/kernel/paging.c` — page tables, W^X, PAT ownership, and memory types.
 - `src/kernel/heap.c` — the guarded, bounded, transactional kernel heap.
 - `src/kernel/pci.c` — PCI configuration space, read two independent ways.
 - `src/kernel/thread.c` — kernel threads, guarded stacks, and the run queue.
@@ -145,6 +148,8 @@ make hooks    # enforce verification in this local clone
 - `docs/PIT_RETIREMENT.md` — recalibrating on that reference, and losing the 8254.
 - `docs/MONOTONIC_TIME.md` — an instant, a deadline, and how bounded a sleep is.
 - `docs/VIRTUAL_MEMORY.md` — owning the tables, and making W^X true on the metal.
+- `docs/WRITE_COMBINING.md` — PAT selection, WC ordering, measurements, and
+  controls.
 - `docs/KERNEL_HEAP.md` — the first allocator that is not a fixed array.
 - `docs/PCI_ENUMERATION.md` — counting the machine, and two readers checking each
   other.
@@ -230,8 +235,10 @@ then proves every frame and every interior page table came home.
 There is also a screen. The Multiboot2 header asks the loader for a linear
 framebuffer, optionally, so a loader that cannot set a graphics mode still boots;
 what comes back is validated field by field rather than assumed, carved out of
-the identity map as uncacheable device memory across as many 2 MiB regions as it
-spans, and then proved. Boot writes a pattern whose colour is a function of the
+the identity map as 4 KiB write-combining pages across as many 2 MiB regions as
+it spans, while APIC, VGA, and PCI ECAM stay uncacheable. Boot verifies the exact
+PAT readback and every framebuffer page before use. It writes a pattern whose
+colour is a function of the
 coordinates and reads all 786,432 pixels back, because a framebuffer looks right
 long before it is right and `CONTRIBUTING.md` says screenshots are not proof.
 
@@ -265,7 +272,8 @@ read back off the framebuffer and compared against the decode before boot
 continues. Text is drawn into a 3 MiB heap-backed surface in ordinary
 write-back memory; glyph-sized damage and one-line updates present only their
 bounding rectangle, while a scroll copies cached rows before its one full
-present. Verification still reads the framebuffer, so the back buffer cannot
+present. Every present fences its WC stores before clearing damage or permitting
+readback. Verification still reads the framebuffer, so the back buffer cannot
 certify its own addressing. A thread that overflows its stack is contained by
 its guard page and the double-fault stack, but cannot yet be diagnosed as an
 overflow, because the page fault has no interrupt stack of its own. It has a

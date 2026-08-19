@@ -65,6 +65,10 @@ void install_page_tables(
     const struct boot_framebuffer *framebuffer
 );
 void prove_paging_lifecycle(void);
+void prove_write_combining(
+    const struct acpi_topology *topology,
+    const struct boot_framebuffer *framebuffer
+);
 
 void bring_up_heap(void);
 void prove_heap_lifecycle(void);

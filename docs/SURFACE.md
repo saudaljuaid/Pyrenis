@@ -1,10 +1,10 @@
 # Cached pixels
 
-The framebuffer is device memory. Seneri maps it uncacheable, so reading a
-pixel back during a scroll can be far more expensive on a real processor than
-reading the same pixel from ordinary RAM. QEMU TCG does not model that cache
-difference. The surface keeps the working picture in write-back heap memory and
-uses the framebuffer only as the final destination.
+The framebuffer is device memory, while the surface is ordinary write-back RAM.
+Scrolling reads and moves pixels only in that cached surface, then writes the
+damaged rectangle to a write-combining framebuffer. VGA and register windows
+remain uncacheable. QEMU TCG does not model that distinction; WHPX can execute
+the guest stores on the host processor but still presents to a virtual display.
 
 At the boot mode used by the tests, the surface is 1024 x 768 x 4 bytes:
 3,145,728 bytes. That is one allocation from the 16 MiB guarded heap and one
@@ -29,8 +29,8 @@ pitch.
   walks right-to-left. The opposite overlaps walk forward.
 - Every successful write unions its clipped extent into one bounding damage
   rectangle. An empty present copies nothing. A non-empty present copies only
-  that rectangle and clears damage only after every volatile framebuffer store
-  has completed.
+  that rectangle, executes `sfence` after the volatile WC stores, and clears
+  damage only after that completion boundary.
 - A present requires an active framebuffer with exactly the same width and
   height. Framebuffer pitch remains independent and is used when finding each
   device row.
@@ -55,11 +55,14 @@ After framebuffer bring-up, `prove_surface` allocates a real full-size surface
 and uses `cpu_read_tsc()` around a full fill and present, a 16-pixel-high line
 update and present, and a cached scroll plus present. It reads selected pixels
 back from the framebuffer and requires the copied-pixel counters to be 786,432,
-16,384, and 786,432 respectively. A normal boot prints four lines of this form:
+16,384, and 786,432 respectively. It also dirties opposite corners to expose the
+full-screen cost of one union rectangle. A normal boot prints lines of this form:
 
 ```text
 Seneri OS: surface 1024x768 pitch 4096 buffer 3145728 bytes
 Seneri OS: surface cycles full present <cycles> one-line update <cycles> scroll <cycles>
+Seneri OS: surface split cycles full draw <cycles> push <cycles> one-line draw <cycles> push <cycles> scroll draw <cycles> push <cycles>
+Seneri OS: surface sparse two-corner cycles total <cycles> draw <cycles> push <cycles> union 786432
 Seneri OS: surface copied 786432 full, 16384 line, 786432 scroll pixels
 Seneri OS: cached surface established
 ```
@@ -73,12 +76,14 @@ diagnostic is:
 ST SURFACE full 786432 line 16384 clipped 4 overlap both damage 20
 ```
 
-## Cycle measurements
+## Cached-surface cycle measurements
 
-Each number below is the median of five boots; the range is in parentheses.
-The before kernel is the branch head before this increment with measurement
-lines added around the existing operations. The after kernel is the final row-
-copy implementation. Both use `cpu_read_tsc()`. A full operation touches
+This table is the historical measurement for introducing the cached surface,
+before the framebuffer acquired WC. Each number is the median of five boots;
+the range is in parentheses. The before kernel is the branch head before that
+increment with measurement lines added around the existing operations. The
+after kernel is its final row-copy implementation. Both use `cpu_read_tsc()`. A
+full operation touches
 786,432 visible pixels, a line touches 16,384, and a scroll moves or presents
 the full 1024 x 768 picture.
 
@@ -102,6 +107,11 @@ KVM was attempted inside the available Ubuntu environment and could not start:
 No bootable real-hardware target was available. Therefore the WHPX scroll
 result is cache-aware virtual-hardware evidence, not a claim that KVM or bare
 metal was measured.
+
+The current UC-versus-WC measurements split cached work from framebuffer push
+for full, one-line, scroll, and sparse-union operations. They live in
+`docs/WRITE_COMBINING.md`; keeping them there makes clear which increment and
+which page-table policy each number measures.
 
 ## Flake sweep
 
@@ -146,5 +156,5 @@ counted above.
   glyph scratch prevents torn scratch data, but concurrent writers still need a
   later serialization design.
 - KVM and bare-metal cycle measurements remain open evidence gaps. In
-  particular, the uncacheable framebuffer mapping has not been validated on a
+  particular, the write-combining framebuffer path has not been validated on a
   physical display controller here.

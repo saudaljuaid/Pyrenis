@@ -171,10 +171,11 @@ and is still undone.
     paging_initialize(topology, mcfg)
     paging_initialize(topology, mcfg, framebuffer)
 
-Every addition is a *device window* — a physical range that must be carved out
-of the identity map as uncacheable. That is one concept wearing three parameters,
-and the next device window makes it four. It should be a
-`struct paging_device_windows`, and the change is small today.
+Every addition is a *typed physical window* — a range carved out of the bulk
+write-back identity map. APIC, VGA, and PCI ECAM are uncacheable; the framebuffer
+is write-combining; ordinary RAM stays write-back. That is one memory-type layer
+wearing three parameters, and the next window makes it four. It should be a
+`struct paging_device_windows` whose entries name both span and memory type.
 
 `kernel_test_run` has the same shape for the same reason, at four parameters.
 

@@ -18,8 +18,9 @@
  * Two decisions are worth stating because neither is forced.
  *
  * The first is that drawing goes through a cached surface. Reading the
- * framebuffer to scroll means one uncacheable device read per pixel; moving
- * the same pixels in ordinary RAM avoids that cost. Verification still reads
+ * device framebuffer to scroll means one device read per pixel, while moving
+ * the same pixels in ordinary write-back RAM avoids that cost. Verification
+ * still reads
  * the framebuffer after present, because asking the surface whether it agrees
  * with itself would turn the strongest proof in this stack into no proof.
  *

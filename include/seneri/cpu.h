@@ -60,6 +60,10 @@ void cpu_cpuid(uint32_t leaf, uint32_t subleaf, struct cpuid_result *result);
 uint64_t cpu_read_msr(uint32_t msr);
 void cpu_write_msr(uint32_t msr, uint64_t value);
 uint64_t cpu_read_tsc(void);
+/* Drain all older stores, including weakly ordered write-combining stores. */
+void cpu_store_fence(void);
+/* Write back and invalidate every internal cache before a memory-type change. */
+void cpu_write_back_and_invalidate_cache(void);
 uint64_t cpu_read_cr2(void);
 uint64_t cpu_read_cr0(void);
 void cpu_write_cr0(uint64_t value);

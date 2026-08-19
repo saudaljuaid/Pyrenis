@@ -301,6 +301,7 @@ _Noreturn void kernel_main(uint32_t magic, uintptr_t boot_information)
      */
     install_page_tables(&boot_topology,
         boot_mcfg_present ? &boot_mcfg : NULL, &context.framebuffer);
+    prove_write_combining(&boot_topology, &context.framebuffer);
     prove_paging_lifecycle();
     bring_up_heap();
     prove_heap_lifecycle();

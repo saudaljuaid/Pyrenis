@@ -9,7 +9,7 @@ TEST_BUILD_DIR := $(BUILD_DIR)/tests
 TEST_SCENARIOS := normal breakpoint invalid-opcode page-fault ist pit unexpected \
 	double-fault apic ioapic retired apic-timer tsc pm-timer pit-retired timers \
 	paging heap pci pci-ecam threads thread-guard framebuffer screen keyboard shell \
-	surface
+	surface write-combining
 TEST_TARGETS := $(addprefix qemu-test-,$(TEST_SCENARIOS))
 
 CC := gcc
@@ -194,6 +194,7 @@ qemu-test-%: $(TEST_BUILD_DIR)/%/seneri.iso
 		keyboard) expected=83 ;; \
 		shell) expected=85 ;; \
 		surface) expected=87 ;; \
+		write-combining) expected=89 ;; \
 		*) echo 'unknown QEMU scenario: $*'; exit 1 ;; \
 	esac; \
 	# Only pci-ecam departs from the default machine. i440fx publishes no \
@@ -255,6 +256,9 @@ qemu-test-%: $(TEST_BUILD_DIR)/%/seneri.iso
 		  ! grep -Eq '^Seneri OS: paging leaves [0-9]+ writable [0-9]+ executable [0-9]+ both 0$$' "$$log" || \
 		  ! grep -Fq 'Seneri OS: kernel page tables installed' "$$log" || \
 		  ! grep -Fq 'Seneri OS: no writable executable mapping' "$$log" || \
+		  ! grep -Eq '^Seneri OS: IA32_PAT before 0x[0-9A-F]{16} after 0x[0-9A-F]{16} entry 1 write-combining$$' "$$log" || \
+		  ! grep -Eq '^Seneri OS: framebuffer memory type write-combining pages [1-9][0-9]*$$' "$$log" || \
+		  ! grep -Fq 'Seneri OS: write-combining established' "$$log" || \
 		  ! grep -Fq 'Seneri OS: virtual memory established' "$$log" || \
 		  ! grep -Eq '^Seneri OS: heap window 0x[0-9A-F]+ size [0-9]+ guards 0x[0-9A-F]+ 0x[0-9A-F]+$$' "$$log" || \
 		  ! grep -Eq '^Seneri OS: heap committed [0-9]+ bytes in [0-9]+ pages, live 3$$' "$$log" || \
@@ -276,6 +280,8 @@ qemu-test-%: $(TEST_BUILD_DIR)/%/seneri.iso
 		  ! grep -Fq 'Seneri OS: framebuffer established' "$$log" || \
 		  ! grep -Eq '^Seneri OS: surface [0-9]+x[0-9]+ pitch [0-9]+ buffer [0-9]+ bytes$$' "$$log" || \
 		  ! grep -Eq '^Seneri OS: surface cycles full present [0-9]+ one-line update [0-9]+ scroll [0-9]+$$' "$$log" || \
+		  ! grep -Eq '^Seneri OS: surface split cycles full draw [0-9]+ push [0-9]+ one-line draw [0-9]+ push [0-9]+ scroll draw [0-9]+ push [0-9]+$$' "$$log" || \
+		  ! grep -Eq '^Seneri OS: surface sparse two-corner cycles total [0-9]+ draw [0-9]+ push [0-9]+ union [0-9]+$$' "$$log" || \
 		  ! grep -Eq '^Seneri OS: surface copied [0-9]+ full, [0-9]+ line, [0-9]+ scroll pixels$$' "$$log" || \
 		  ! grep -Fq 'Seneri OS: cached surface established' "$$log" || \
 		  ! grep -Eq '^Seneri OS: screen console [0-9]+x[0-9]+ cells of 8x16, font [0-9]+ bytes$$' "$$log" || \
@@ -335,6 +341,9 @@ qemu-test-%: $(TEST_BUILD_DIR)/%/seneri.iso
 				diagnostics_ok=false ;; \
 		surface) \
 			grep -Eq '^ST SURFACE full [0-9]+ line [0-9]+ clipped 4 overlap both damage 20$$' "$$log" || \
+				diagnostics_ok=false ;; \
+		write-combining) \
+			grep -Eq '^ST WRITE-COMBINING PAT 0x[0-9A-F]{16} ENTRY 1 FRAMEBUFFER [1-9][0-9]* PAGES$$' "$$log" || \
 				diagnostics_ok=false ;; \
 		thread-guard) \
 			grep -Fq 'ST THREAD guard 0x0000000800005000' "$$log" && \

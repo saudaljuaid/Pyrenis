@@ -1,6 +1,6 @@
 # Where everything is
 
-Seneri is forty-three source files and twenty-seven documents. This page exists
+Seneri is forty-three source files and twenty-eight documents. This page exists
 so you never have to find your way through that by opening files at random.
 
 If you are here because the code looked impenetrable: it is not that you are
@@ -84,7 +84,7 @@ long you will be in there.
 | File | | |
 | --- | ---: | --- |
 | `physical_memory.c` | 454 | Which physical frames exist and which are free. |
-| `paging.c` | 2293 | Four-level page tables, W^X enforced by hardware, device windows uncached. The densest file here. |
+| `paging.c` | 2596 | Four-level page tables, W^X, PAT ownership, and WB/WC/UC memory types. The densest file here. |
 | `heap.c` | 792 | A bounded, guarded allocator. The first thing that is not a fixed array. |
 
 ### More than one thing at a time
@@ -98,8 +98,8 @@ long you will be in there.
 
 | File | | |
 | --- | ---: | --- |
-| `framebuffer.c` | 460 | The linear framebuffer, validated field by field, mapped uncached. |
-| `surface.c` | 795 | Cached pixels, clipped primitives, overlap-safe copies, and damage. |
+| `framebuffer.c` | 467 | The linear framebuffer, validated field by field, mapped write-combining. |
+| `surface.c` | 815 | Cached pixels, clipped primitives, overlap-safe copies, damage, and the WC store fence. |
 | `screen.c` | 604 | Text on the framebuffer: cells, wrapping, scrolling, and reading it back. |
 | `keyboard.c` | 728 | The 8042 and scancode set 1. The first device a person operates. |
 | `shell.c` | 657 | A command line. The first layer here that never panics. |
@@ -113,7 +113,7 @@ long you will be in there.
 
 | File | | |
 | --- | ---: | --- |
-| `test.c` | 3572 | The twenty-seven QEMU scenarios and what each must print. |
+| `test.c` | 3670 | The twenty-eight QEMU scenarios and what each must print. |
 | `self_test.c` | 588 | Checks that run on synthetic data every boot, before any hardware is touched. |
 
 ## The boot sequence, in order
@@ -133,6 +133,7 @@ it happens.
     frame_allocator_initialize    own physical memory
     prove_frame_lifecycle
     install_page_tables           own the address space, W^X on
+    prove_write_combining         PAT readback and every WB/WC/UC window
     prove_paging_lifecycle
     bring_up_heap                 allocation that is not a fixed array
     prove_heap_lifecycle

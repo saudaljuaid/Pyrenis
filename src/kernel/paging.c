@@ -22,6 +22,7 @@
 #define PAGE_DIRTY (UINT64_C(1) << 6)
 #define PAGE_HUGE (UINT64_C(1) << 7)
 #define PAGE_GLOBAL (UINT64_C(1) << 8)
+#define PAGE_LARGE_PAT (UINT64_C(1) << 12)
 #define PAGE_NO_EXECUTE (UINT64_C(1) << 63)
 
 /*
@@ -62,16 +63,27 @@
 #define CR4_FIVE_LEVEL_PAGING (UINT64_C(1) << 12)
 
 /*
- * Intel SDM volume 3A section 12.12.2: IA32_PAT is MSR 0x277 and holds eight
- * one-byte memory types. With the PAT bit of a leaf clear, PWT and PCD select
- * entries 0 through 3, so PCD together with PWT selects entry 3. Section
- * 12.12.4 gives the power-on value, in which entry 3 is uncacheable. Seneri
- * checks that entry rather than reprogramming the register, because a write to
- * IA32_PAT changes the meaning of every mapping already in place.
+ * Intel SDM volume 3A section 14.8: IA32_PAT is MSR 0x277 and holds eight
+ * one-byte memory types. The bootstrap hierarchy selects only entry 0. Existing
+ * Seneri mappings select entry 0 for RAM and entry 3 for device registers, so
+ * entry 1 can be changed without retyping a live mapping. PWT alone selects it
+ * at every leaf size, avoiding the PAT bit whose position differs between 4 KiB
+ * and large leaves. Entry 0 remains write-back and entry 3 uncacheable.
  */
 #define IA32_PAT_MSR UINT32_C(0x00000277)
-#define PAT_UNCACHEABLE UINT64_C(0x00)
+#define PAT_TYPE_UNCACHEABLE UINT8_C(0x00)
+#define PAT_TYPE_WRITE_COMBINING UINT8_C(0x01)
+#define PAT_TYPE_WRITE_THROUGH UINT8_C(0x04)
+#define PAT_TYPE_WRITE_PROTECTED UINT8_C(0x05)
+#define PAT_TYPE_WRITE_BACK UINT8_C(0x06)
+#define PAT_TYPE_UNCACHED_MINUS UINT8_C(0x07)
+#define PAT_WRITE_BACK_ENTRY 0U
+#define PAT_WRITE_COMBINING_ENTRY 1U
 #define PAT_DEVICE_ENTRY 3U
+
+/* Intel SDM volume 2A CPUID: CPUID.01H:EDX[16] reports IA32_PAT. */
+#define CPUID_BASIC_FEATURES UINT32_C(0x00000001)
+#define CPUID_PAT UINT32_C(0x00010000)
 
 /*
  * Intel SDM volume 3A section 4.1.4 and AMD APM volume 2 section 5.4.1: the
@@ -145,6 +157,7 @@ _Static_assert(
 #define PAGING_TEST_ARENA_PAGES 6U
 #define PAGING_TEST_ENTRIES \
     (PAGING_TEST_ARENA_PAGES * (PAGING_PAGE_SIZE / sizeof(uint64_t)))
+#define PAGING_TEST_PAT UINT64_C(0x0007040600070106)
 
 extern uint8_t __kernel_start[];
 extern uint8_t __kernel_end[];
@@ -182,6 +195,76 @@ static struct paging_section kernel_sections[PAGING_MAX_SECTIONS];
 static size_t fine_region_count;
 static size_t kernel_section_count;
 static uint64_t test_arena[PAGING_TEST_ENTRIES] __attribute__((aligned(4096)));
+
+static uint8_t pat_entry(uint64_t pat, unsigned int index)
+{
+    return (uint8_t)(pat >> (index * 8U));
+}
+
+static uint64_t pat_replace_entry(
+    uint64_t pat,
+    unsigned int index,
+    uint8_t memory_type
+)
+{
+    const unsigned int shift = index * 8U;
+    const uint64_t mask = UINT64_C(0xFF) << shift;
+
+    return (pat & ~mask) | ((uint64_t)memory_type << shift);
+}
+
+static enum paging_memory_type decode_pat_type(uint8_t memory_type)
+{
+    switch (memory_type) {
+    case PAT_TYPE_WRITE_BACK:
+        return PAGING_MEMORY_WRITE_BACK;
+    case PAT_TYPE_WRITE_COMBINING:
+        return PAGING_MEMORY_WRITE_COMBINING;
+    case PAT_TYPE_UNCACHEABLE:
+        return PAGING_MEMORY_UNCACHEABLE;
+    case PAT_TYPE_WRITE_THROUGH:
+        return PAGING_MEMORY_WRITE_THROUGH;
+    case PAT_TYPE_WRITE_PROTECTED:
+        return PAGING_MEMORY_WRITE_PROTECTED;
+    case PAT_TYPE_UNCACHED_MINUS:
+        return PAGING_MEMORY_UNCACHED_MINUS;
+    default:
+        return PAGING_MEMORY_INVALID;
+    }
+}
+
+/*
+ * Intel SDM volume 3A table 14-11: PWT is index bit 0, PCD bit 1, and PAT
+ * bit 2. The PAT bit is leaf bit 7 for a 4 KiB PTE and bit 12 for a large leaf.
+ */
+static unsigned int leaf_pat_index(uint64_t entry, unsigned int level)
+{
+    const uint64_t pat_bit = level == 1U ? PAGE_HUGE : PAGE_LARGE_PAT;
+    unsigned int index = 0U;
+
+    if ((entry & PAGE_WRITE_THROUGH) != 0U) {
+        index |= 1U;
+    }
+
+    if ((entry & PAGE_CACHE_DISABLE) != 0U) {
+        index |= 2U;
+    }
+
+    if ((entry & pat_bit) != 0U) {
+        index |= 4U;
+    }
+
+    return index;
+}
+
+static enum paging_memory_type leaf_memory_type(
+    uint64_t entry,
+    unsigned int level,
+    uint64_t pat
+)
+{
+    return decode_pat_type(pat_entry(pat, leaf_pat_index(entry, level)));
+}
 
 /*
  * Every table frame is below SENERI_EARLY_PHYSICAL_LIMIT and that whole range
@@ -247,12 +330,22 @@ static uint64_t permissions_to_flags(uint32_t permissions)
         flags |= PAGE_CACHE_DISABLE | PAGE_WRITE_THROUGH;
     }
 
+    if ((permissions & PAGING_WRITE_COMBINING) != 0U) {
+        flags |= PAGE_WRITE_THROUGH;
+    }
+
     return flags;
 }
 
-static uint32_t flags_to_permissions(uint64_t entry)
+static uint32_t flags_to_permissions(
+    uint64_t entry,
+    unsigned int level,
+    uint64_t pat
+)
 {
     uint32_t permissions = PAGING_READ;
+    const enum paging_memory_type memory_type =
+        leaf_memory_type(entry, level, pat);
 
     if ((entry & PAGE_WRITABLE) != 0U) {
         permissions |= PAGING_WRITE;
@@ -262,8 +355,10 @@ static uint32_t flags_to_permissions(uint64_t entry)
         permissions |= PAGING_EXECUTE;
     }
 
-    if ((entry & PAGE_CACHE_DISABLE) != 0U) {
+    if (memory_type == PAGING_MEMORY_UNCACHEABLE) {
         permissions |= PAGING_UNCACHED;
+    } else if (memory_type == PAGING_MEMORY_WRITE_COMBINING) {
+        permissions |= PAGING_WRITE_COMBINING;
     }
 
     return permissions;
@@ -271,7 +366,8 @@ static uint32_t flags_to_permissions(uint64_t entry)
 
 static enum paging_status validate_permissions(uint32_t permissions)
 {
-    const uint32_t known = PAGING_WRITE | PAGING_EXECUTE | PAGING_UNCACHED;
+    const uint32_t known = PAGING_WRITE | PAGING_EXECUTE | PAGING_UNCACHED |
+        PAGING_WRITE_COMBINING;
 
     /*
      * There is no user flag to request. Refusing an unknown bit rather than
@@ -285,6 +381,11 @@ static enum paging_status validate_permissions(uint32_t permissions)
     if ((permissions & PAGING_WRITE) != 0U &&
         (permissions & PAGING_EXECUTE) != 0U) {
         return PAGING_STATUS_WRITABLE_AND_EXECUTABLE;
+    }
+
+    if ((permissions & PAGING_UNCACHED) != 0U &&
+        (permissions & PAGING_WRITE_COMBINING) != 0U) {
+        return PAGING_STATUS_CONFLICTING_MEMORY_TYPES;
     }
 
     return PAGING_STATUS_OK;
@@ -717,14 +818,19 @@ static enum paging_status protect_range(
     struct page_hierarchy *hierarchy,
     uint64_t virtual_address,
     uint64_t length,
-    uint32_t permissions
+    uint32_t permissions,
+    uint64_t pat
 )
 {
     enum paging_status status = validate_permissions(permissions);
+    enum paging_memory_type requested_type;
 
     if (status != PAGING_STATUS_OK) {
         return status;
     }
+
+    requested_type = leaf_memory_type(permissions_to_flags(permissions), 1U,
+        pat);
 
     status = validate_virtual_range(virtual_address, length, PAGING_PAGE_SIZE);
 
@@ -738,6 +844,25 @@ static enum paging_status protect_range(
         return status;
     }
 
+    /*
+     * Changing a live physical range's memory type needs the processor's full
+     * cache-transition protocol, not only INVLPG. This protection API changes
+     * access rights; it refuses to smuggle a cache-policy transition into that
+     * operation. Boot establishes framebuffer WC before the hierarchy is live.
+     */
+    for (uint64_t offset = 0U; offset < length; offset += PAGING_PAGE_SIZE) {
+        uint64_t *entry = NULL;
+
+        status = entry_for(hierarchy, virtual_address + offset, 1U, false,
+            &entry);
+
+        if (status != PAGING_STATUS_OK ||
+            leaf_memory_type(*entry, 1U, pat) != requested_type) {
+            return status == PAGING_STATUS_OK ?
+                PAGING_STATUS_MEMORY_TYPE_CHANGE_UNSAFE : status;
+        }
+    }
+
     apply_permissions(hierarchy, virtual_address, length, permissions);
     return PAGING_STATUS_OK;
 }
@@ -748,10 +873,13 @@ static void fill_translation(
     uint64_t virtual_address,
     unsigned int level,
     bool writable,
-    bool executable
+    bool executable,
+    uint64_t pat
 )
 {
     const uint64_t page_size = level_page_size(level);
+    const enum paging_memory_type memory_type =
+        leaf_memory_type(entry, level, pat);
     uint32_t permissions = PAGING_READ;
 
     if (writable) {
@@ -762,14 +890,17 @@ static void fill_translation(
         permissions |= PAGING_EXECUTE;
     }
 
-    if ((entry & PAGE_CACHE_DISABLE) != 0U) {
+    if (memory_type == PAGING_MEMORY_UNCACHEABLE) {
         permissions |= PAGING_UNCACHED;
+    } else if (memory_type == PAGING_MEMORY_WRITE_COMBINING) {
+        permissions |= PAGING_WRITE_COMBINING;
     }
 
     translation->physical_address =
         (entry & PAGE_FRAME_MASK & ~(page_size - 1U)) |
         (virtual_address & (page_size - 1U));
     translation->permissions = permissions;
+    translation->memory_type = memory_type;
     translation->level = level;
 }
 
@@ -782,7 +913,8 @@ static void fill_translation(
 static enum paging_status translate_address(
     struct page_hierarchy *hierarchy,
     uint64_t virtual_address,
-    struct paging_translation *translation
+    struct paging_translation *translation,
+    uint64_t pat
 )
 {
     uint64_t table = hierarchy->root;
@@ -792,6 +924,7 @@ static enum paging_status translate_address(
 
     translation->physical_address = 0U;
     translation->permissions = PAGING_READ;
+    translation->memory_type = PAGING_MEMORY_INVALID;
     translation->level = 0U;
 
     if (!address_is_canonical(virtual_address)) {
@@ -810,7 +943,7 @@ static enum paging_status translate_address(
 
         if ((entry & PAGE_HUGE) != 0U) {
             fill_translation(translation, entry, virtual_address, level,
-                writable, executable);
+                writable, executable, pat);
             return PAGING_STATUS_OK;
         }
 
@@ -826,7 +959,7 @@ static enum paging_status translate_address(
     writable = writable && (entry & PAGE_WRITABLE) != 0U;
     executable = executable && (entry & PAGE_NO_EXECUTE) == 0U;
     fill_translation(translation, entry, virtual_address, 1U, writable,
-        executable);
+        executable, pat);
     return PAGING_STATUS_OK;
 }
 
@@ -910,17 +1043,20 @@ static void audit_hierarchy(
  * machine nobody can arrange.
  */
 static enum paging_status decode_processor_support(
+    uint32_t basic_features_edx,
     uint32_t extended_root_eax,
     uint32_t extended_features_edx,
     uint64_t cr4,
     uint64_t pat
 )
 {
-    const unsigned int pat_shift = 8U * PAT_DEVICE_ENTRY;
-
     if (extended_root_eax < CPUID_EXTENDED_FEATURES ||
         (extended_features_edx & CPUID_NO_EXECUTE) == 0U) {
         return PAGING_STATUS_NO_EXECUTE_UNSUPPORTED;
+    }
+
+    if ((basic_features_edx & CPUID_PAT) == 0U) {
+        return PAGING_STATUS_PAT_UNSUPPORTED;
     }
 
     if ((cr4 & CR4_FIVE_LEVEL_PAGING) != 0U) {
@@ -931,8 +1067,15 @@ static enum paging_status decode_processor_support(
         return PAGING_STATUS_PHYSICAL_EXTENSION_DISABLED;
     }
 
-    if (((pat >> pat_shift) & UINT64_C(0xFF)) != PAT_UNCACHEABLE) {
-        return PAGING_STATUS_CACHE_POLICY_UNAVAILABLE;
+    for (unsigned int index = 0U; index < 8U; ++index) {
+        if (decode_pat_type(pat_entry(pat, index)) == PAGING_MEMORY_INVALID) {
+            return PAGING_STATUS_PAT_LAYOUT_UNSAFE;
+        }
+    }
+
+    if (pat_entry(pat, PAT_WRITE_BACK_ENTRY) != PAT_TYPE_WRITE_BACK ||
+        pat_entry(pat, PAT_DEVICE_ENTRY) != PAT_TYPE_UNCACHEABLE) {
+        return PAGING_STATUS_PAT_LAYOUT_UNSAFE;
     }
 
     return PAGING_STATUS_OK;
@@ -1059,7 +1202,7 @@ static uint64_t select_ecam_window(const struct acpi_mcfg *mcfg)
  * The span of identity map a framebuffer needs, rounded out to whole 2 MiB
  * regions because that is the unit a device window is carved in. Returns zero
  * when there is nothing to map or when what the loader set will not fit inside
- * the bound above - a framebuffer that is partly uncacheable would be worse
+ * the bound above - a framebuffer that is partly write-combining would be worse
  * than one that is not mapped at all, because half of it would work.
  */
 static uint64_t framebuffer_span(
@@ -1099,6 +1242,26 @@ static uint64_t framebuffer_span(
     return span;
 }
 
+/* The precise set of 4 KiB leaves that intersects the framebuffer bytes. */
+static uint64_t framebuffer_page_span(
+    const struct boot_framebuffer *framebuffer,
+    uint64_t *base_out
+)
+{
+    uint64_t region_base = 0U;
+    uint64_t end;
+
+    if (framebuffer_span(framebuffer, &region_base) == 0U) {
+        *base_out = 0U;
+        return 0U;
+    }
+
+    *base_out = framebuffer->address & ~(PAGING_PAGE_SIZE - 1U);
+    end = (framebuffer->address + framebuffer->size + PAGING_PAGE_SIZE - 1U) &
+        ~(PAGING_PAGE_SIZE - 1U);
+    return end - *base_out;
+}
+
 static void collect_sections(
     const struct acpi_topology *topology,
     const struct acpi_mcfg *mcfg,
@@ -1110,6 +1273,8 @@ static void collect_sections(
     const uint64_t kernel_start = (uint64_t)(uintptr_t)__kernel_start;
     const uint64_t text_start = (uint64_t)(uintptr_t)__text_start;
     const uint32_t device = PAGING_WRITE | PAGING_UNCACHED;
+    const uint32_t framebuffer_memory =
+        PAGING_WRITE | PAGING_WRITE_COMBINING;
     uint64_t ecam;
 
     *count = 0U;
@@ -1148,16 +1313,18 @@ static void collect_sections(
     }
 
     /*
-     * The framebuffer is device memory for the same reason the APIC windows
-     * are, and one section covers however many regions it spans.
+     * The framebuffer is a sequential store destination, not a register file.
+     * It alone gets write-combining; VGA, APIC, and ECAM register windows stay
+     * strongly uncacheable above. One section covers every framebuffer region.
      */
     {
         uint64_t framebuffer_base = 0U;
-        const uint64_t span = framebuffer_span(framebuffer, &framebuffer_base);
+        const uint64_t span =
+            framebuffer_page_span(framebuffer, &framebuffer_base);
 
         if (span != 0U) {
             add_section(sections, count, framebuffer_base,
-                framebuffer_base + span, device);
+                framebuffer_base + span, framebuffer_memory);
         }
     }
 }
@@ -1237,7 +1404,8 @@ static enum paging_status build_identity_map(struct page_hierarchy *hierarchy)
  * nothing on the serial line.
  */
 static enum paging_status validate_identity_map(
-    struct page_hierarchy *hierarchy
+    struct page_hierarchy *hierarchy,
+    uint64_t pat
 )
 {
     struct paging_translation translation;
@@ -1249,7 +1417,7 @@ static enum paging_status validate_identity_map(
             uint32_t expected;
 
             if (address == 0U) {
-                if (translate_address(hierarchy, address, &translation) !=
+                if (translate_address(hierarchy, address, &translation, pat) !=
                     PAGING_STATUS_NOT_MAPPED) {
                     return PAGING_STATUS_VALIDATION_FAILURE;
                 }
@@ -1260,7 +1428,7 @@ static enum paging_status validate_identity_map(
             expected = section_permissions(kernel_sections,
                 kernel_section_count, address);
 
-            if (translate_address(hierarchy, address, &translation) !=
+            if (translate_address(hierarchy, address, &translation, pat) !=
                     PAGING_STATUS_OK ||
                 translation.physical_address != address ||
                 translation.permissions != expected ||
@@ -1276,7 +1444,7 @@ static enum paging_status validate_identity_map(
             continue;
         }
 
-        if (translate_address(hierarchy, base, &translation) !=
+        if (translate_address(hierarchy, base, &translation, pat) !=
                 PAGING_STATUS_OK ||
             translation.physical_address != base ||
             translation.permissions != PAGING_WRITE ||
@@ -1298,6 +1466,9 @@ static void reset_state(void)
     state.framebuffer_base = 0U;
     state.framebuffer_size = 0U;
     state.framebuffer_regions = 0U;
+    state.pat_before = 0U;
+    state.pat_after = 0U;
+    state.write_combining_pat_entry = 0U;
     state.no_execute_active = false;
     state.write_protect_active = false;
     state.active = false;
@@ -1336,14 +1507,20 @@ enum paging_status paging_initialize(
 )
 {
     const uint64_t ecam = select_ecam_window(mcfg);
+    uint64_t framebuffer_region_base = 0U;
+    const uint64_t framebuffer_region_bytes =
+        framebuffer_span(framebuffer, &framebuffer_region_base);
     uint64_t framebuffer_base = 0U;
     const uint64_t framebuffer_bytes =
-        framebuffer_span(framebuffer, &framebuffer_base);
+        framebuffer_page_span(framebuffer, &framebuffer_base);
+    struct cpuid_result basic;
     struct cpuid_result extended;
     struct paging_audit audit;
     uint32_t extended_features_edx = 0U;
     uint32_t extended_root_eax;
     uint64_t previous_root;
+    uint64_t pat_before = 0U;
+    uint64_t pat_after;
     uint64_t root = 0U;
     enum paging_status status;
 
@@ -1363,6 +1540,7 @@ enum paging_status paging_initialize(
         return PAGING_STATUS_INTERRUPTS_ENABLED;
     }
 
+    cpu_cpuid(CPUID_BASIC_FEATURES, 0U, &basic);
     cpu_cpuid(CPUID_EXTENDED_ROOT, 0U, &extended);
     extended_root_eax = extended.eax;
 
@@ -1371,13 +1549,21 @@ enum paging_status paging_initialize(
         extended_features_edx = extended.edx;
     }
 
-    status = decode_processor_support(extended_root_eax, extended_features_edx,
-        cpu_read_cr4(), cpu_read_msr(IA32_PAT_MSR));
+    /* RDMSR itself is unsafe until CPUID has established that IA32_PAT exists. */
+    if ((basic.edx & CPUID_PAT) != 0U) {
+        pat_before = cpu_read_msr(IA32_PAT_MSR);
+    }
+
+    status = decode_processor_support(basic.edx, extended_root_eax,
+        extended_features_edx, cpu_read_cr4(), pat_before);
 
     if (status != PAGING_STATUS_OK) {
         reset_state();
         return status;
     }
+
+    pat_after = pat_replace_entry(pat_before, PAT_WRITE_COMBINING_ENTRY,
+        PAT_TYPE_WRITE_COMBINING);
 
     status = enable_processor_features();
 
@@ -1406,10 +1592,10 @@ enum paging_status paging_initialize(
         add_region(fine_regions, &fine_region_count, ecam);
     }
 
-    for (uint64_t offset = 0U; offset < framebuffer_bytes;
+    for (uint64_t offset = 0U; offset < framebuffer_region_bytes;
          offset += PAGING_HUGE_PAGE_SIZE) {
         add_region(fine_regions, &fine_region_count,
-            framebuffer_base + offset);
+            framebuffer_region_base + offset);
     }
 
     collect_sections(topology, mcfg, framebuffer, kernel_sections,
@@ -1435,7 +1621,7 @@ enum paging_status paging_initialize(
         return status;
     }
 
-    status = validate_identity_map(&live_hierarchy);
+    status = validate_identity_map(&live_hierarchy, pat_after);
 
     if (status != PAGING_STATUS_OK) {
         reset_state();
@@ -1454,6 +1640,20 @@ enum paging_status paging_initialize(
         return PAGING_STATUS_VALIDATION_FAILURE;
     }
 
+    /*
+     * Entry 1 is unused by the bootstrap mapping, so changing it cannot retype
+     * an active translation. Program it only after the inactive hierarchy has
+     * passed its complete walk, and require an exact readback before CR3 can
+     * select it for framebuffer leaves.
+     */
+    cpu_write_msr(IA32_PAT_MSR, pat_after);
+
+    if (cpu_read_msr(IA32_PAT_MSR) != pat_after) {
+        cpu_write_msr(IA32_PAT_MSR, pat_before);
+        reset_state();
+        return PAGING_STATUS_PAT_READBACK_MISMATCH;
+    }
+
     previous_root = cpu_read_cr3();
     state.root_physical_address = live_hierarchy.root;
     state.table_frames = live_hierarchy.table_frames;
@@ -1463,13 +1663,23 @@ enum paging_status paging_initialize(
     state.framebuffer_base = framebuffer_bytes == 0U ? 0U : framebuffer_base;
     state.framebuffer_size = framebuffer_bytes;
     state.framebuffer_regions =
-        (size_t)(framebuffer_bytes / PAGING_HUGE_PAGE_SIZE);
+        (size_t)(framebuffer_region_bytes / PAGING_HUGE_PAGE_SIZE);
+    state.pat_before = pat_before;
+    state.pat_after = pat_after;
+    state.write_combining_pat_entry = PAT_WRITE_COMBINING_ENTRY;
     state.no_execute_active = true;
     state.write_protect_active = true;
     state.active = true;
     live_hierarchy.live = true;
 
+    /*
+     * The bootstrap hierarchy may have named the framebuffer with a different
+     * type. Drain every old cache line before CR3 changes that physical span's
+     * type; the second WBINVD completes the conservative transition sequence.
+     */
+    cpu_write_back_and_invalidate_cache();
     cpu_write_cr3(live_hierarchy.root);
+    cpu_write_back_and_invalidate_cache();
     status = paging_verify();
 
     if (status != PAGING_STATUS_OK) {
@@ -1478,7 +1688,10 @@ enum paging_status paging_initialize(
          * going back to it is the one recovery available. Reporting a status
          * from the old address space beats halting inside the new one.
          */
+        cpu_write_back_and_invalidate_cache();
         cpu_write_cr3(previous_root);
+        cpu_write_back_and_invalidate_cache();
+        cpu_write_msr(IA32_PAT_MSR, pat_before);
         live_hierarchy.live = false;
         reset_state();
         return status;
@@ -1534,7 +1747,8 @@ enum paging_status paging_protect(
         return PAGING_STATUS_NOT_INITIALIZED;
     }
 
-    return protect_range(&live_hierarchy, virtual_address, length, permissions);
+    return protect_range(&live_hierarchy, virtual_address, length, permissions,
+        state.pat_after);
 }
 
 enum paging_status paging_translate(
@@ -1548,13 +1762,15 @@ enum paging_status paging_translate(
 
     translation->physical_address = 0U;
     translation->permissions = PAGING_READ;
+    translation->memory_type = PAGING_MEMORY_INVALID;
     translation->level = 0U;
 
     if (!state.active) {
         return PAGING_STATUS_NOT_INITIALIZED;
     }
 
-    return translate_address(&live_hierarchy, virtual_address, translation);
+    return translate_address(&live_hierarchy, virtual_address, translation,
+        state.pat_after);
 }
 
 enum paging_status paging_audit_hierarchy(struct paging_audit *audit)
@@ -1608,6 +1824,12 @@ enum paging_status paging_verify(void)
         return PAGING_STATUS_VALIDATION_FAILURE;
     }
 
+    if (cpu_read_msr(IA32_PAT_MSR) != state.pat_after ||
+        pat_entry(state.pat_after, state.write_combining_pat_entry) !=
+            PAT_TYPE_WRITE_COMBINING) {
+        return PAGING_STATUS_PAT_READBACK_MISMATCH;
+    }
+
     if ((cpu_read_msr(IA32_EFER_MSR) & EFER_NO_EXECUTE_ENABLE) == 0U) {
         return PAGING_STATUS_NO_EXECUTE_INACTIVE;
     }
@@ -1626,7 +1848,8 @@ enum paging_status paging_verify(void)
          ++index) {
         const uint64_t address = (uint64_t)(uintptr_t)expected[index].symbol;
 
-        if (translate_address(&live_hierarchy, address, &translation) !=
+        if (translate_address(&live_hierarchy, address, &translation,
+                state.pat_after) !=
                 PAGING_STATUS_OK ||
             translation.physical_address != address ||
             translation.permissions != expected[index].permissions) {
@@ -1634,7 +1857,7 @@ enum paging_status paging_verify(void)
         }
     }
 
-    if (translate_address(&live_hierarchy, 0U, &translation) !=
+    if (translate_address(&live_hierarchy, 0U, &translation, state.pat_after) !=
         PAGING_STATUS_NOT_MAPPED) {
         return PAGING_STATUS_VALIDATION_FAILURE;
     }
@@ -1718,8 +1941,10 @@ static bool test_entry_composition(void)
         PAGING_WRITE,
         PAGING_EXECUTE,
         PAGING_UNCACHED,
+        PAGING_WRITE_COMBINING,
         PAGING_WRITE | PAGING_UNCACHED,
-        PAGING_EXECUTE | PAGING_UNCACHED
+        PAGING_EXECUTE | PAGING_UNCACHED,
+        PAGING_WRITE | PAGING_WRITE_COMBINING
     };
 
     const uint64_t frame = UINT64_C(0x000ABCDE12345000);
@@ -1730,7 +1955,7 @@ static bool test_entry_composition(void)
         if ((entry & PAGE_FRAME_MASK) != frame ||
             (entry & PAGE_PRESENT) == 0U ||
             (entry & PAGE_USER) != 0U ||
-            flags_to_permissions(entry) != cases[index]) {
+            flags_to_permissions(entry, 1U, PAGING_TEST_PAT) != cases[index]) {
             return false;
         }
     }
@@ -1738,15 +1963,61 @@ static bool test_entry_composition(void)
     /* Read-only means no-execute is set, not merely that write is clear. */
     if ((permissions_to_flags(PAGING_READ) & PAGE_NO_EXECUTE) == 0U ||
         (permissions_to_flags(PAGING_EXECUTE) & PAGE_NO_EXECUTE) != 0U ||
-        (permissions_to_flags(PAGING_UNCACHED) & PAGE_CACHE_DISABLE) == 0U) {
+        (permissions_to_flags(PAGING_UNCACHED) & PAGE_CACHE_DISABLE) == 0U ||
+        (permissions_to_flags(PAGING_WRITE_COMBINING) & PAGE_WRITE_THROUGH) ==
+            0U ||
+        (permissions_to_flags(PAGING_WRITE_COMBINING) & PAGE_CACHE_DISABLE) !=
+            0U) {
         return false;
     }
 
     return validate_permissions(PAGING_WRITE | PAGING_EXECUTE) ==
             PAGING_STATUS_WRITABLE_AND_EXECUTABLE &&
-        validate_permissions(1U << 3) == PAGING_STATUS_BAD_PERMISSIONS &&
+        validate_permissions(1U << 4) == PAGING_STATUS_BAD_PERMISSIONS &&
+        validate_permissions(PAGING_UNCACHED | PAGING_WRITE_COMBINING) ==
+            PAGING_STATUS_CONFLICTING_MEMORY_TYPES &&
         validate_permissions(PAGING_WRITE | PAGING_UNCACHED) ==
+            PAGING_STATUS_OK &&
+        validate_permissions(PAGING_WRITE | PAGING_WRITE_COMBINING) ==
             PAGING_STATUS_OK;
+}
+
+static bool test_pat_model(void)
+{
+    const uint64_t pat = UINT64_C(0x0106070504000106);
+
+    if (pat_entry(pat, 0U) != PAT_TYPE_WRITE_BACK ||
+        pat_entry(pat, 1U) != PAT_TYPE_WRITE_COMBINING ||
+        pat_entry(pat, 2U) != PAT_TYPE_UNCACHEABLE ||
+        pat_entry(pat, 3U) != PAT_TYPE_WRITE_THROUGH ||
+        pat_replace_entry(pat, 1U, PAT_TYPE_WRITE_THROUGH) !=
+            UINT64_C(0x0106070504000406)) {
+        return false;
+    }
+
+    if (leaf_pat_index(0U, 1U) != 0U ||
+        leaf_pat_index(PAGE_WRITE_THROUGH, 1U) != 1U ||
+        leaf_pat_index(PAGE_CACHE_DISABLE, 1U) != 2U ||
+        leaf_pat_index(PAGE_WRITE_THROUGH | PAGE_CACHE_DISABLE, 1U) != 3U ||
+        leaf_pat_index(PAGE_HUGE, 1U) != 4U ||
+        leaf_pat_index(PAGE_HUGE, 2U) != 0U ||
+        leaf_pat_index(PAGE_LARGE_PAT, 2U) != 4U ||
+        leaf_pat_index(PAGE_LARGE_PAT | PAGE_WRITE_THROUGH, 2U) != 5U) {
+        return false;
+    }
+
+    return leaf_memory_type(0U, 1U, pat) == PAGING_MEMORY_WRITE_BACK &&
+        leaf_memory_type(PAGE_WRITE_THROUGH, 1U, pat) ==
+            PAGING_MEMORY_WRITE_COMBINING &&
+        leaf_memory_type(PAGE_CACHE_DISABLE, 1U, pat) ==
+            PAGING_MEMORY_UNCACHEABLE &&
+        leaf_memory_type(PAGE_WRITE_THROUGH | PAGE_CACHE_DISABLE, 1U, pat) ==
+            PAGING_MEMORY_WRITE_THROUGH &&
+        leaf_memory_type(PAGE_HUGE, 1U, pat) ==
+            PAGING_MEMORY_WRITE_PROTECTED &&
+        leaf_memory_type(PAGE_LARGE_PAT | PAGE_WRITE_THROUGH, 2U, pat) ==
+            PAGING_MEMORY_UNCACHED_MINUS &&
+        decode_pat_type(UINT8_C(0x02)) == PAGING_MEMORY_INVALID;
 }
 
 static bool test_range_validation(void)
@@ -1823,13 +2094,14 @@ static bool test_hierarchy_operations(void)
     }
 
     /* Nothing is mapped yet, so every operation on the page must refuse. */
-    if (translate_address(&hierarchy, address, &translation) !=
+    if (translate_address(&hierarchy, address, &translation, PAGING_TEST_PAT) !=
             PAGING_STATUS_NOT_MAPPED ||
         translation.level != 0U ||
         translation.physical_address != 0U ||
         unmap_range(&hierarchy, address, PAGING_PAGE_SIZE) !=
             PAGING_STATUS_NOT_MAPPED ||
-        protect_range(&hierarchy, address, PAGING_PAGE_SIZE, PAGING_WRITE) !=
+        protect_range(&hierarchy, address, PAGING_PAGE_SIZE, PAGING_WRITE,
+            PAGING_TEST_PAT) !=
             PAGING_STATUS_NOT_MAPPED) {
         return false;
     }
@@ -1839,7 +2111,8 @@ static bool test_hierarchy_operations(void)
         return false;
     }
 
-    if (translate_address(&hierarchy, address + 0x40U, &translation) !=
+    if (translate_address(&hierarchy, address + 0x40U, &translation,
+            PAGING_TEST_PAT) !=
             PAGING_STATUS_OK ||
         translation.physical_address != frame + 0x40U ||
         translation.permissions != PAGING_WRITE ||
@@ -1853,14 +2126,18 @@ static bool test_hierarchy_operations(void)
     }
 
     if (protect_range(&hierarchy, address, PAGING_PAGE_SIZE,
-            PAGING_WRITE | PAGING_EXECUTE) !=
+            PAGING_WRITE | PAGING_EXECUTE, PAGING_TEST_PAT) !=
         PAGING_STATUS_WRITABLE_AND_EXECUTABLE) {
         return false;
     }
 
-    if (protect_range(&hierarchy, address, PAGING_PAGE_SIZE, PAGING_READ) !=
+    if (protect_range(&hierarchy, address, PAGING_PAGE_SIZE,
+            PAGING_WRITE_COMBINING, PAGING_TEST_PAT) !=
+            PAGING_STATUS_MEMORY_TYPE_CHANGE_UNSAFE ||
+        protect_range(&hierarchy, address, PAGING_PAGE_SIZE, PAGING_READ,
+            PAGING_TEST_PAT) !=
             PAGING_STATUS_OK ||
-        translate_address(&hierarchy, address, &translation) !=
+        translate_address(&hierarchy, address, &translation, PAGING_TEST_PAT) !=
             PAGING_STATUS_OK ||
         translation.permissions != PAGING_READ ||
         translation.physical_address != frame) {
@@ -1880,7 +2157,7 @@ static bool test_hierarchy_operations(void)
 
     if (unmap_range(&hierarchy, address, PAGING_PAGE_SIZE) !=
             PAGING_STATUS_OK ||
-        translate_address(&hierarchy, address, &translation) !=
+        translate_address(&hierarchy, address, &translation, PAGING_TEST_PAT) !=
             PAGING_STATUS_NOT_MAPPED ||
         unmap_range(&hierarchy, address, PAGING_PAGE_SIZE) !=
             PAGING_STATUS_NOT_MAPPED) {
@@ -1892,7 +2169,8 @@ static bool test_hierarchy_operations(void)
         return false;
     }
 
-    if (translate_address(&hierarchy, huge_address + 0x1000U, &translation) !=
+    if (translate_address(&hierarchy, huge_address + 0x1000U, &translation,
+            PAGING_TEST_PAT) !=
             PAGING_STATUS_OK ||
         translation.level != 2U ||
         translation.permissions != PAGING_WRITE ||
@@ -1906,7 +2184,7 @@ static bool test_hierarchy_operations(void)
         unmap_range(&hierarchy, huge_address, PAGING_PAGE_SIZE) !=
             PAGING_STATUS_HUGE_PAGE_PRESENT ||
         protect_range(&hierarchy, huge_address, PAGING_PAGE_SIZE,
-            PAGING_READ) != PAGING_STATUS_HUGE_PAGE_PRESENT) {
+            PAGING_READ, PAGING_TEST_PAT) != PAGING_STATUS_HUGE_PAGE_PRESENT) {
         return false;
     }
 
@@ -2018,7 +2296,7 @@ static bool test_table_reclamation(void)
     /* Emptying half a table reclaims nothing. */
     if (unmap_range(&hierarchy, first, PAGING_PAGE_SIZE) != PAGING_STATUS_OK ||
         hierarchy.table_frames != 4U ||
-        translate_address(&hierarchy, second, &translation) !=
+        translate_address(&hierarchy, second, &translation, PAGING_TEST_PAT) !=
             PAGING_STATUS_OK) {
         return false;
     }
@@ -2042,7 +2320,7 @@ static bool test_table_reclamation(void)
      */
     if (map_range(&hierarchy, first, PAGING_HUGE_PAGE_SIZE,
             PAGING_HUGE_PAGE_SIZE, PAGING_WRITE, 2U) != PAGING_STATUS_OK ||
-        translate_address(&hierarchy, first, &translation) !=
+        translate_address(&hierarchy, first, &translation, PAGING_TEST_PAT) !=
             PAGING_STATUS_OK ||
         translation.level != 2U) {
         return false;
@@ -2066,7 +2344,7 @@ static bool test_table_reclamation(void)
 
     if (unmap_range(&hierarchy, far, PAGING_PAGE_SIZE) != PAGING_STATUS_OK ||
         hierarchy.table_frames != 4U ||
-        translate_address(&hierarchy, first, &translation) !=
+        translate_address(&hierarchy, first, &translation, PAGING_TEST_PAT) !=
             PAGING_STATUS_OK) {
         return false;
     }
@@ -2075,7 +2353,7 @@ static bool test_table_reclamation(void)
     return unmap_range(&hierarchy, first, PAGING_PAGE_SIZE) ==
             PAGING_STATUS_OK &&
         hierarchy.table_frames == 1U &&
-        translate_address(&hierarchy, far, &translation) ==
+        translate_address(&hierarchy, far, &translation, PAGING_TEST_PAT) ==
             PAGING_STATUS_NOT_MAPPED;
 }
 
@@ -2151,35 +2429,45 @@ static bool test_layout_and_processor_checks(void)
     }
 
     /* Every reason this hierarchy would be a lie on the running processor. */
-    if (decode_processor_support(CPUID_EXTENDED_FEATURES, CPUID_NO_EXECUTE,
-            CR4_PHYSICAL_ADDRESS_EXTENSION,
+    if (decode_processor_support(CPUID_PAT, CPUID_EXTENDED_FEATURES,
+            CPUID_NO_EXECUTE, CR4_PHYSICAL_ADDRESS_EXTENSION,
             UINT64_C(0x0007040600070406)) != PAGING_STATUS_OK) {
         return false;
     }
 
-    if (decode_processor_support(CPUID_EXTENDED_ROOT, CPUID_NO_EXECUTE,
-            CR4_PHYSICAL_ADDRESS_EXTENSION, UINT64_C(0x0007040600070406)) !=
+    if (decode_processor_support(CPUID_PAT, CPUID_EXTENDED_ROOT,
+            CPUID_NO_EXECUTE, CR4_PHYSICAL_ADDRESS_EXTENSION,
+            UINT64_C(0x0007040600070406)) !=
             PAGING_STATUS_NO_EXECUTE_UNSUPPORTED ||
-        decode_processor_support(CPUID_EXTENDED_FEATURES, 0U,
+        decode_processor_support(CPUID_PAT, CPUID_EXTENDED_FEATURES, 0U,
             CR4_PHYSICAL_ADDRESS_EXTENSION, UINT64_C(0x0007040600070406)) !=
             PAGING_STATUS_NO_EXECUTE_UNSUPPORTED) {
         return false;
     }
 
-    if (decode_processor_support(CPUID_EXTENDED_FEATURES, CPUID_NO_EXECUTE,
+    if (decode_processor_support(CPUID_PAT, CPUID_EXTENDED_FEATURES,
+            CPUID_NO_EXECUTE,
             CR4_PHYSICAL_ADDRESS_EXTENSION | CR4_FIVE_LEVEL_PAGING,
             UINT64_C(0x0007040600070406)) !=
             PAGING_STATUS_FIVE_LEVEL_PAGING ||
-        decode_processor_support(CPUID_EXTENDED_FEATURES, CPUID_NO_EXECUTE, 0U,
-            UINT64_C(0x0007040600070406)) !=
+        decode_processor_support(CPUID_PAT, CPUID_EXTENDED_FEATURES,
+            CPUID_NO_EXECUTE, 0U, UINT64_C(0x0007040600070406)) !=
             PAGING_STATUS_PHYSICAL_EXTENSION_DISABLED) {
         return false;
     }
 
-    /* A PAT whose entry 3 is write-back would make every device page cached. */
-    return decode_processor_support(CPUID_EXTENDED_FEATURES, CPUID_NO_EXECUTE,
-        CR4_PHYSICAL_ADDRESS_EXTENSION, UINT64_C(0x0007040606070406)) ==
-        PAGING_STATUS_CACHE_POLICY_UNAVAILABLE;
+    /* Both absence of PAT and an unsafe existing layout have named refusals. */
+    return decode_processor_support(0U, CPUID_EXTENDED_FEATURES,
+            CPUID_NO_EXECUTE, CR4_PHYSICAL_ADDRESS_EXTENSION,
+            UINT64_C(0x0007040600070406)) == PAGING_STATUS_PAT_UNSUPPORTED &&
+        decode_processor_support(CPUID_PAT, CPUID_EXTENDED_FEATURES,
+            CPUID_NO_EXECUTE, CR4_PHYSICAL_ADDRESS_EXTENSION,
+            UINT64_C(0x0007040606070406)) ==
+                PAGING_STATUS_PAT_LAYOUT_UNSAFE &&
+        decode_processor_support(CPUID_PAT, CPUID_EXTENDED_FEATURES,
+            CPUID_NO_EXECUTE, CR4_PHYSICAL_ADDRESS_EXTENSION,
+            UINT64_C(0x0007040600070206)) ==
+                PAGING_STATUS_PAT_LAYOUT_UNSAFE;
 }
 
 /*
@@ -2195,6 +2483,7 @@ bool paging_self_test(void)
     struct paging_audit audit;
 
     if (!test_indices_and_canonical_form() || !test_entry_composition() ||
+        !test_pat_model() ||
         !test_range_validation() || !test_hierarchy_operations() ||
         !test_table_reclamation() || !test_table_supply() ||
         !test_layout_and_processor_checks()) {
@@ -2238,56 +2527,70 @@ bool paging_self_test(void)
 
 const char *paging_status_string(enum paging_status status)
 {
-    switch (status) {
-    case PAGING_STATUS_OK:
-        return "ok";
-    case PAGING_STATUS_NULL_ARGUMENT:
-        return "null paging argument";
-    case PAGING_STATUS_ALREADY_INITIALIZED:
-        return "page tables were installed twice";
-    case PAGING_STATUS_NOT_INITIALIZED:
-        return "kernel page tables are not installed";
-    case PAGING_STATUS_INTERRUPTS_ENABLED:
-        return "installing page tables requires interrupts disabled";
-    case PAGING_STATUS_NO_EXECUTE_UNSUPPORTED:
-        return "processor reports no no-execute bit";
-    case PAGING_STATUS_NO_EXECUTE_INACTIVE:
-        return "the no-execute bit did not take effect in EFER";
-    case PAGING_STATUS_WRITE_PROTECT_INACTIVE:
-        return "supervisor write protection did not take effect in CR0";
-    case PAGING_STATUS_FIVE_LEVEL_PAGING:
-        return "processor is using a five-level page hierarchy";
-    case PAGING_STATUS_PHYSICAL_EXTENSION_DISABLED:
-        return "physical address extension is disabled";
-    case PAGING_STATUS_CACHE_POLICY_UNAVAILABLE:
-        return "no uncacheable page attribute entry is available";
-    case PAGING_STATUS_BAD_KERNEL_LAYOUT:
-        return "linked kernel layout cannot be mapped per section";
-    case PAGING_STATUS_ZERO_LENGTH:
-        return "paging range is empty";
-    case PAGING_STATUS_UNALIGNED_ADDRESS:
-        return "paging address or length is unaligned";
-    case PAGING_STATUS_NONCANONICAL_ADDRESS:
-        return "virtual address is not canonical";
-    case PAGING_STATUS_RANGE_OVERFLOW:
-        return "paging range overflows";
-    case PAGING_STATUS_PHYSICAL_TOO_WIDE:
-        return "physical address is too wide for a page table entry";
-    case PAGING_STATUS_BAD_PERMISSIONS:
-        return "paging permissions name an unknown right";
-    case PAGING_STATUS_WRITABLE_AND_EXECUTABLE:
-        return "a page may not be writable and executable";
-    case PAGING_STATUS_ALREADY_MAPPED:
-        return "virtual page is already mapped";
-    case PAGING_STATUS_NOT_MAPPED:
-        return "virtual page is not mapped";
-    case PAGING_STATUS_HUGE_PAGE_PRESENT:
-        return "a larger page already covers this address";
-    case PAGING_STATUS_OUT_OF_FRAMES:
-        return "no physical frame is available for a page table";
-    case PAGING_STATUS_VALIDATION_FAILURE:
-        return "installed page tables do not match their intent";
-    default:
+    static const char *const messages[PAGING_STATUS_COUNT] = {
+        "ok",
+        "null paging argument",
+        "page tables were installed twice",
+        "kernel page tables are not installed",
+        "installing page tables requires interrupts disabled",
+        "processor reports no no-execute bit",
+        "the no-execute bit did not take effect in EFER",
+        "supervisor write protection did not take effect in CR0",
+        "processor is using a five-level page hierarchy",
+        "physical address extension is disabled",
+        "processor reports no page attribute table",
+        "existing page attribute table layout is unsafe",
+        "page attribute table readback did not match",
+        "linked kernel layout cannot be mapped per section",
+        "paging range is empty",
+        "paging address or length is unaligned",
+        "virtual address is not canonical",
+        "paging range overflows",
+        "physical address is too wide for a page table entry",
+        "paging permissions name an unknown right",
+        "paging request combines incompatible memory types",
+        "changing a live page memory type is unsafe",
+        "a page may not be writable and executable",
+        "virtual page is already mapped",
+        "virtual page is not mapped",
+        "a larger page already covers this address",
+        "no physical frame is available for a page table",
+        "installed page tables do not match their intent"
+    };
+
+    _Static_assert(
+        sizeof(messages) / sizeof(messages[0]) == PAGING_STATUS_COUNT,
+        "paging status messages are out of sync"
+    );
+
+    if (status < PAGING_STATUS_OK || status >= PAGING_STATUS_COUNT) {
         return "unknown paging status";
     }
+
+    return messages[status];
+}
+
+const char *paging_memory_type_string(enum paging_memory_type memory_type)
+{
+    static const char *const names[PAGING_MEMORY_TYPE_COUNT] = {
+        "write-back",
+        "write-combining",
+        "uncacheable",
+        "write-through",
+        "write-protected",
+        "uncached-minus",
+        "invalid"
+    };
+
+    _Static_assert(
+        sizeof(names) / sizeof(names[0]) == PAGING_MEMORY_TYPE_COUNT,
+        "paging memory type names are out of sync"
+    );
+
+    if (memory_type < PAGING_MEMORY_WRITE_BACK ||
+        memory_type >= PAGING_MEMORY_TYPE_COUNT) {
+        return "unknown";
+    }
+
+    return names[memory_type];
 }

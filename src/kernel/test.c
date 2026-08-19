@@ -248,6 +248,10 @@ static enum kernel_test_scenario scenario_from_value(
         return KERNEL_TEST_SURFACE;
     }
 
+    if (token_equals(value, length, "write-combining")) {
+        return KERNEL_TEST_WRITE_COMBINING;
+    }
+
     return KERNEL_TEST_INVALID;
 }
 
@@ -318,6 +322,8 @@ static uint8_t scenario_exit_value(enum kernel_test_scenario scenario)
         return UINT8_C(0x2A);
     case KERNEL_TEST_SURFACE:
         return UINT8_C(0x2B);
+    case KERNEL_TEST_WRITE_COMBINING:
+        return UINT8_C(0x2C);
     default:
         return QEMU_FAILURE_VALUE;
     }
@@ -3119,6 +3125,91 @@ static void surface_scenario(void)
     console_write(" clipped 4 overlap both damage 20\n");
 }
 
+static void write_combining_scenario(
+    const struct boot_framebuffer *framebuffer
+)
+{
+    const struct paging_state paging = paging_get_state();
+    struct paging_translation translation;
+    struct surface cached = {0};
+
+    if (framebuffer == NULL || !framebuffer->present ||
+        paging.framebuffer_size == 0U) {
+        kernel_test_fail("the write-combining scenario has no framebuffer");
+    }
+
+    if (paging_verify() != PAGING_STATUS_OK ||
+        paging.write_combining_pat_entry != 1U ||
+        ((paging.pat_after >> 8U) & UINT64_C(0xFF)) != 1U) {
+        kernel_test_fail("IA32_PAT does not select write-combining entry 1");
+    }
+
+    for (unsigned int index = 0U; index < 8U; ++index) {
+        if (index != paging.write_combining_pat_entry &&
+            ((paging.pat_before >> (index * 8U)) & UINT64_C(0xFF)) !=
+                ((paging.pat_after >> (index * 8U)) & UINT64_C(0xFF))) {
+            kernel_test_fail("IA32_PAT changed an entry it did not own");
+        }
+    }
+
+    for (uint64_t offset = 0U; offset < paging.framebuffer_size;
+         offset += PAGING_PAGE_SIZE) {
+        const uint64_t address = paging.framebuffer_base + offset;
+
+        if (paging_translate(address, &translation) != PAGING_STATUS_OK ||
+            translation.physical_address != address ||
+            translation.level != 1U ||
+            translation.permissions !=
+                (PAGING_WRITE | PAGING_WRITE_COMBINING) ||
+            translation.memory_type != PAGING_MEMORY_WRITE_COMBINING) {
+            kernel_test_fail("a framebuffer page is not write-combining");
+        }
+    }
+
+    for (uint64_t offset = 0U; offset < paging.ecam_window_size;
+         offset += PAGING_PAGE_SIZE) {
+        const uint64_t address = paging.ecam_window_base + offset;
+
+        if (paging_translate(address, &translation) != PAGING_STATUS_OK ||
+            translation.permissions != (PAGING_WRITE | PAGING_UNCACHED) ||
+            translation.memory_type != PAGING_MEMORY_UNCACHEABLE) {
+            kernel_test_fail("a PCI ECAM page is not uncacheable");
+        }
+    }
+
+    if (paging_translate((uint64_t)(uintptr_t)&active_scenario, &translation) !=
+            PAGING_STATUS_OK ||
+        translation.permissions != PAGING_WRITE ||
+        translation.memory_type != PAGING_MEMORY_WRITE_BACK) {
+        kernel_test_fail("ordinary kernel RAM is not write-back");
+    }
+
+    if (paging_map(PAGING_PROBE_ADDRESS, 0U, PAGING_PAGE_SIZE,
+            PAGING_UNCACHED | PAGING_WRITE_COMBINING) !=
+        PAGING_STATUS_CONFLICTING_MEMORY_TYPES) {
+        kernel_test_fail("paging accepted incompatible memory types");
+    }
+
+    if (surface_initialize(&cached, framebuffer->width, framebuffer->height) !=
+            SURFACE_STATUS_OK ||
+        surface_verify(&cached) != SURFACE_STATUS_OK) {
+        kernel_test_fail("the cached surface is not write-back");
+    }
+
+    if (surface_release(&cached) != SURFACE_STATUS_OK ||
+        framebuffer_verify() != FRAMEBUFFER_STATUS_OK) {
+        kernel_test_fail("write-combining state did not survive verification");
+    }
+
+    console_write("ST WRITE-COMBINING PAT ");
+    console_write_hex(paging.pat_after);
+    console_write(" ENTRY ");
+    console_write_u64(paging.write_combining_pat_entry);
+    console_write(" FRAMEBUFFER ");
+    console_write_u64(paging.framebuffer_size / PAGING_PAGE_SIZE);
+    console_write(" PAGES\n");
+}
+
 static void framebuffer_scenario(const struct boot_framebuffer *framebuffer)
 {
     struct framebuffer_state screen;
@@ -3205,6 +3296,8 @@ static void framebuffer_scenario(const struct boot_framebuffer *framebuffer)
             kernel_test_fail("the framebuffer refused a visible pixel");
         }
     }
+
+    cpu_store_fence();
 
     for (size_t index = 0; index < probes; ++index) {
         const uint32_t x = coordinates[index][0];
@@ -3416,6 +3509,9 @@ void kernel_test_run(
     case KERNEL_TEST_SURFACE:
         surface_scenario();
         kernel_test_pass();
+    case KERNEL_TEST_WRITE_COMBINING:
+        write_combining_scenario(framebuffer);
+        kernel_test_pass();
     case KERNEL_TEST_DOUBLE_FAULT:
         kernel_test_double_fault_armed = 1U;
         interrupt_test_set_gate_present(14U, false);
@@ -3553,6 +3649,8 @@ const char *kernel_test_scenario_name(enum kernel_test_scenario scenario)
         return "shell";
     case KERNEL_TEST_SURFACE:
         return "surface";
+    case KERNEL_TEST_WRITE_COMBINING:
+        return "write-combining";
     case KERNEL_TEST_INVALID:
         return "invalid";
     default:

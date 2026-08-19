@@ -67,6 +67,10 @@
 #define CLOCK_PROOF_FREQUENCY UINT32_C(100)
 #define CLOCK_PROOF_TICKS UINT64_C(20)
 
+#define WRITE_COMBINING_VGA_TEXT_BUFFER UINT64_C(0x000B8000)
+
+static uint8_t write_back_probe;
+
 /*
  * The deadline the boot sleep asks for: 50 ms. Long enough that the fixed cost
  * of programming the timer is a small fraction of it, so the measured sleep can
@@ -519,6 +523,112 @@ void install_page_tables(
 
     console_write("Seneri OS: kernel page tables installed\n");
     console_write("Seneri OS: no writable executable mapping\n");
+}
+
+static bool window_has_memory_type(
+    uint64_t base,
+    uint64_t length,
+    uint32_t permissions,
+    enum paging_memory_type memory_type
+)
+{
+    for (uint64_t offset = 0U; offset < length; offset += PAGING_PAGE_SIZE) {
+        struct paging_translation translation;
+        const uint64_t address = base + offset;
+
+        if (paging_translate(address, &translation) != PAGING_STATUS_OK ||
+            translation.physical_address != address ||
+            translation.permissions != permissions ||
+            translation.memory_type != memory_type ||
+            translation.level != 1U) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+/*
+ * Prove the cache-policy layer before any framebuffer store. Paging's build
+ * walk checked the inactive hierarchy; this walk checks the hierarchy CR3 now
+ * selects and checks every page, so a correct first page cannot hide a wrong
+ * tail. Register windows are audited separately to make a leaked WC policy name
+ * the device whose ordering would be unsafe.
+ */
+void prove_write_combining(
+    const struct acpi_topology *topology,
+    const struct boot_framebuffer *framebuffer
+)
+{
+    const struct paging_state paging = paging_get_state();
+    struct paging_translation ordinary;
+
+    if (topology == NULL || framebuffer == NULL) {
+        console_panic("write-combining proof has no boot description");
+    }
+
+    if (paging_verify() != PAGING_STATUS_OK ||
+        paging.write_combining_pat_entry != 1U ||
+        ((paging.pat_after >>
+            (paging.write_combining_pat_entry * 8U)) & UINT64_C(0xFF)) != 1U) {
+        console_panic("IA32_PAT write-combining readback is wrong");
+    }
+
+    if (!window_has_memory_type(WRITE_COMBINING_VGA_TEXT_BUFFER,
+            PAGING_PAGE_SIZE, PAGING_WRITE | PAGING_UNCACHED,
+            PAGING_MEMORY_UNCACHEABLE)) {
+        console_panic("VGA window is not uncacheable");
+    }
+
+    if (!window_has_memory_type(topology->local_apic_address,
+            PAGING_PAGE_SIZE, PAGING_WRITE | PAGING_UNCACHED,
+            PAGING_MEMORY_UNCACHEABLE)) {
+        console_panic("local APIC window is not uncacheable");
+    }
+
+    for (size_t index = 0U; index < topology->io_apic_count; ++index) {
+        if (!window_has_memory_type(topology->io_apics[index].address,
+                PAGING_PAGE_SIZE, PAGING_WRITE | PAGING_UNCACHED,
+                PAGING_MEMORY_UNCACHEABLE)) {
+            console_panic("I/O APIC window is not uncacheable");
+        }
+    }
+
+    if (paging.ecam_window_size != 0U &&
+        !window_has_memory_type(paging.ecam_window_base,
+            paging.ecam_window_size, PAGING_WRITE | PAGING_UNCACHED,
+            PAGING_MEMORY_UNCACHEABLE)) {
+        console_panic("PCI ECAM window is not uncacheable");
+    }
+
+    if (paging.framebuffer_size != 0U &&
+        !window_has_memory_type(paging.framebuffer_base,
+            paging.framebuffer_size, PAGING_WRITE | PAGING_WRITE_COMBINING,
+            PAGING_MEMORY_WRITE_COMBINING)) {
+        console_panic("framebuffer range is not write-combining");
+    }
+
+    if (paging_translate((uint64_t)(uintptr_t)&write_back_probe, &ordinary) !=
+            PAGING_STATUS_OK ||
+        ordinary.memory_type != PAGING_MEMORY_WRITE_BACK ||
+        ordinary.permissions != PAGING_WRITE) {
+        console_panic("ordinary RAM is not write-back");
+    }
+
+    console_write("Seneri OS: IA32_PAT before ");
+    console_write_hex(paging.pat_before);
+    console_write(" after ");
+    console_write_hex(paging.pat_after);
+    console_write(" entry ");
+    console_write_u64(paging.write_combining_pat_entry);
+    console_write(" write-combining\n");
+    console_write("Seneri OS: framebuffer memory type ");
+    console_write(paging.framebuffer_size == 0U ? "absent" :
+        paging_memory_type_string(PAGING_MEMORY_WRITE_COMBINING));
+    console_write(" pages ");
+    console_write_u64(paging.framebuffer_size / PAGING_PAGE_SIZE);
+    console_putc('\n');
+    console_write("Seneri OS: write-combining established\n");
 }
 
 /*
@@ -1215,6 +1325,8 @@ void prove_framebuffer(const struct boot_framebuffer *framebuffer)
         }
     }
 
+    cpu_store_fence();
+
     /*
      * Read every one back. Only the bits the loader called channels are
      * compared: the fourth byte of a 32-bit pixel is not a channel it
@@ -1275,6 +1387,8 @@ void prove_surface(void)
     const struct framebuffer_state framebuffer = framebuffer_get_state();
     const uint32_t colour = framebuffer_pack(0x21U, 0x43U, 0x65U);
     const uint32_t line_colour = framebuffer_pack(0x76U, 0x54U, 0x32U);
+    const uint32_t first_corner = framebuffer_pack(0x12U, 0xA4U, 0x5EU);
+    const uint32_t last_corner = framebuffer_pack(0xE1U, 0x37U, 0x8BU);
     const uint32_t line_height = 16U;
     struct surface surface = { 0 };
     struct surface_rect whole;
@@ -1282,9 +1396,21 @@ void prove_surface(void)
     struct surface_rect source;
     struct surface_rect exposed;
     uint64_t start;
+    uint64_t split;
+    uint64_t finish;
     uint64_t full_cycles;
+    uint64_t full_draw_cycles;
+    uint64_t full_push_cycles;
     uint64_t line_cycles;
+    uint64_t line_draw_cycles;
+    uint64_t line_push_cycles;
     uint64_t scroll_cycles;
+    uint64_t scroll_draw_cycles;
+    uint64_t scroll_push_cycles;
+    uint64_t sparse_cycles;
+    uint64_t sparse_draw_cycles;
+    uint64_t sparse_push_cycles;
+    uint64_t scroll_pixels;
     uint32_t pixel = 0U;
     enum surface_status status;
 
@@ -1318,12 +1444,20 @@ void prove_surface(void)
 
     start = cpu_read_tsc();
 
-    if (surface_fill_rect(&surface, whole, colour) != SURFACE_STATUS_OK ||
-        surface_present(&surface) != SURFACE_STATUS_OK) {
+    if (surface_fill_rect(&surface, whole, colour) != SURFACE_STATUS_OK) {
         console_panic("surface could not complete a full present");
     }
 
-    full_cycles = cpu_read_tsc() - start;
+    split = cpu_read_tsc();
+
+    if (surface_present(&surface) != SURFACE_STATUS_OK) {
+        console_panic("surface could not complete a full present");
+    }
+
+    finish = cpu_read_tsc();
+    full_cycles = finish - start;
+    full_draw_cycles = split - start;
+    full_push_cycles = finish - split;
 
     if (surface.last_present_pixels !=
             (uint64_t)surface.width * surface.height ||
@@ -1340,12 +1474,20 @@ void prove_surface(void)
 
     start = cpu_read_tsc();
 
-    if (surface_fill_rect(&surface, line, line_colour) != SURFACE_STATUS_OK ||
-        surface_present(&surface) != SURFACE_STATUS_OK) {
+    if (surface_fill_rect(&surface, line, line_colour) != SURFACE_STATUS_OK) {
         console_panic("surface could not complete a one-line update");
     }
 
-    line_cycles = cpu_read_tsc() - start;
+    split = cpu_read_tsc();
+
+    if (surface_present(&surface) != SURFACE_STATUS_OK) {
+        console_panic("surface could not complete a one-line update");
+    }
+
+    finish = cpu_read_tsc();
+    line_cycles = finish - start;
+    line_draw_cycles = split - start;
+    line_push_cycles = finish - split;
 
     if (surface.last_present_pixels !=
         (uint64_t)surface.width * line_height) {
@@ -1362,12 +1504,21 @@ void prove_surface(void)
     start = cpu_read_tsc();
 
     if (surface_copy_rect(&surface, source, 0U, 0U) != SURFACE_STATUS_OK ||
-        surface_fill_rect(&surface, exposed, colour) != SURFACE_STATUS_OK ||
-        surface_present(&surface) != SURFACE_STATUS_OK) {
+        surface_fill_rect(&surface, exposed, colour) != SURFACE_STATUS_OK) {
         console_panic("surface could not complete a cached scroll");
     }
 
-    scroll_cycles = cpu_read_tsc() - start;
+    split = cpu_read_tsc();
+
+    if (surface_present(&surface) != SURFACE_STATUS_OK) {
+        console_panic("surface could not complete a cached scroll");
+    }
+
+    finish = cpu_read_tsc();
+    scroll_cycles = finish - start;
+    scroll_draw_cycles = split - start;
+    scroll_push_cycles = finish - split;
+    scroll_pixels = surface.last_present_pixels;
 
     if (surface.last_present_pixels !=
         (uint64_t)surface.width * surface.height) {
@@ -1376,6 +1527,40 @@ void prove_surface(void)
 
     if (surface_verify(&surface) != SURFACE_STATUS_OK) {
         console_panic("surface does not match its heap allocation");
+    }
+
+    start = cpu_read_tsc();
+
+    if (surface_pixel(&surface, 0U, 0U, first_corner) != SURFACE_STATUS_OK ||
+        surface_pixel(&surface, surface.width - 1U, surface.height - 1U,
+            last_corner) != SURFACE_STATUS_OK) {
+        console_panic("surface could not dirty its two corners");
+    }
+
+    split = cpu_read_tsc();
+
+    if (surface_present(&surface) != SURFACE_STATUS_OK) {
+        console_panic("surface could not present its two-corner union");
+    }
+
+    finish = cpu_read_tsc();
+    sparse_cycles = finish - start;
+    sparse_draw_cycles = split - start;
+    sparse_push_cycles = finish - split;
+
+    if (surface.last_present_pixels !=
+            (uint64_t)surface.width * surface.height ||
+        framebuffer_read_pixel(0U, 0U, &pixel) != FRAMEBUFFER_STATUS_OK ||
+        (pixel & framebuffer_visible_mask()) !=
+            (first_corner & framebuffer_visible_mask())) {
+        console_panic("two-corner damage missed the first framebuffer corner");
+    }
+
+    if (framebuffer_read_pixel(surface.width - 1U, surface.height - 1U,
+            &pixel) != FRAMEBUFFER_STATUS_OK ||
+        (pixel & framebuffer_visible_mask()) !=
+            (last_corner & framebuffer_visible_mask())) {
+        console_panic("two-corner damage missed the last framebuffer corner");
     }
 
     console_write("Seneri OS: surface ");
@@ -1394,12 +1579,34 @@ void prove_surface(void)
     console_write(" scroll ");
     console_write_u64(scroll_cycles);
     console_putc('\n');
+    console_write("Seneri OS: surface split cycles full draw ");
+    console_write_u64(full_draw_cycles);
+    console_write(" push ");
+    console_write_u64(full_push_cycles);
+    console_write(" one-line draw ");
+    console_write_u64(line_draw_cycles);
+    console_write(" push ");
+    console_write_u64(line_push_cycles);
+    console_write(" scroll draw ");
+    console_write_u64(scroll_draw_cycles);
+    console_write(" push ");
+    console_write_u64(scroll_push_cycles);
+    console_putc('\n');
+    console_write("Seneri OS: surface sparse two-corner cycles total ");
+    console_write_u64(sparse_cycles);
+    console_write(" draw ");
+    console_write_u64(sparse_draw_cycles);
+    console_write(" push ");
+    console_write_u64(sparse_push_cycles);
+    console_write(" union ");
+    console_write_u64(surface.last_present_pixels);
+    console_putc('\n');
     console_write("Seneri OS: surface copied ");
     console_write_u64((uint64_t)surface.width * surface.height);
     console_write(" full, ");
     console_write_u64((uint64_t)surface.width * line_height);
     console_write(" line, ");
-    console_write_u64(surface.last_present_pixels);
+    console_write_u64(scroll_pixels);
     console_write(" scroll pixels\n");
 
     status = surface_release(&surface);
@@ -1509,6 +1716,8 @@ void draw_logo(void)
             }
         }
     }
+
+    cpu_store_fence();
 
     /*
      * Read the whole logo back off the screen. This is what makes the claim

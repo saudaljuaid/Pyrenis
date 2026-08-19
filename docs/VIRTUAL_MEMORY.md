@@ -52,7 +52,9 @@ region that needs 4 KiB granularity.
 | VGA text buffer `0xB8000` | 4 KiB | writable, NX, **uncacheable** |
 | discovered local APIC page | 4 KiB | writable, NX, **uncacheable** |
 | discovered I/O APIC pages | 4 KiB | writable, NX, **uncacheable** |
-| everything else below 4 GiB | 2 MiB | writable, NX |
+| discovered PCI ECAM window | 4 KiB | writable, NX, **uncacheable** |
+| framebuffer-intersecting pages | 4 KiB | writable, NX, **write-combining** |
+| everything else below 4 GiB | 2 MiB | writable, NX, **write-back** |
 
 Every entry is supervisor-only. There is no user flag to request:
 `paging_map` refuses any permission bit it does not recognise, so a caller that
@@ -92,16 +94,18 @@ worked only because MTRRs happened to override it and because QEMU is forgiving.
 Each discovered register page now sets `PCD` and `PWT`, which with the PAT bit
 clear selects PAT entry 3.
 
-Seneri **checks** that entry rather than reprogramming `IA32_PAT`: SDM section
-12.12.4 gives the power-on value, in which entry 3 is uncacheable, and a write to
-`IA32_PAT` changes the meaning of every mapping already in place. A machine whose
-firmware left entry 3 as anything else is refused with
-`PAGING_STATUS_CACHE_POLICY_UNAVAILABLE` rather than silently mapped write-back.
+Seneri checks that entry and entry 0 rather than assuming firmware defaults. It
+then changes only unused entry 1 to write-combining, with exact readback and
+cache flushes around the CR3 transition. The bootstrap hierarchy selects entry
+0; live register mappings select entry 3; framebuffer pages select entry 1 with
+PWT alone. A missing PAT, a reserved byte, or an inherited entry 0/3 with the
+wrong meaning has its own refusal. `docs/WRITE_COMBINING.md` contains the full
+entry-selection and MTRR argument.
 
 **This is unverified on real hardware.** Getting device cacheability wrong
 produces hangs that will not reproduce under QEMU. The addresses come from ACPI,
-not from the `0xFEE00000` / `0xFEC00000` constants, but the cache policy itself
-has only been exercised under emulation.
+not from the `0xFEE00000` / `0xFEC00000` constants, but the UC and WC policies
+have only been exercised under TCG and WHPX.
 
 Every other MMIO region below 4 GiB is still covered by write-back 2 MiB pages,
 exactly as `boot.S` left it. A general device-mapping policy needs a PAT- and
@@ -135,18 +139,22 @@ faults on the very next instruction with no diagnostic anyone can print.
 
 The order is:
 
-1. refuse the processor if NX is unavailable, `LA57` is on, `PAE` is off, or PAT
-   entry 3 is not uncacheable;
+1. refuse the processor if NX or PAT is unavailable, `LA57` is on, `PAE` is off,
+   any PAT byte is reserved, entry 0 is not WB, or entry 3 is not UC;
 2. enable `EFER.NXE` and `CR0.WP`, reading each back;
-3. build the whole hierarchy;
+3. derive a PAT target that changes unused entry 1 to WC and build the whole
+   hierarchy against that target;
 4. **walk it in software and compare every page against the intent** — every
-   4 KiB page of every fine region against its section's permissions, every
-   2 MiB leaf against the bulk policy, and page zero against being absent;
+   4 KiB page of every fine region against its permissions and selected memory
+   type, every 2 MiB leaf against the bulk policy, and page zero against being
+   absent;
 5. run the W^X audit *before* the switch, because installing a hierarchy that
    violates the invariant and only then noticing means the machine already ran
    on it;
-6. load CR3;
-7. re-verify, and on failure **restore the previous CR3** and report a status.
+6. write and read back `IA32_PAT`, execute `WBINVD`, load CR3, and execute
+   `WBINVD` again;
+7. re-verify PAT and the hierarchy, and on failure flush and **restore the
+   previous CR3 and PAT** before reporting a status.
 
 Step 7 is the one recovery available: the boot hierarchy is still intact and
 still maps everything, so reporting a status from the old address space beats
@@ -186,6 +194,10 @@ hierarchy that is not installed, so the self-test cannot evict a live entry.
    refusal leaves the hierarchy exactly as it was found. The only failure the
    apply pass can still hit is table-frame exhaustion, and that one is rolled
    back explicitly.
+7. Translation decodes PAT, PCD, and PWT with the installed PAT value and reports
+   the selected memory type. It never infers type from PCD alone.
+8. A live `paging_protect` may change access rights but not memory type. Such a
+   transition needs the full cache protocol and is refused by name.
 
 ## What is refused
 
@@ -202,6 +214,8 @@ a complete one.
 - an arithmetic overflow in either the virtual or physical range;
 - a physical address wider than the 51:12 field an entry provides;
 - a permission naming a right that does not exist;
+- a request naming both uncacheable and write-combining memory;
+- a protection request that would change a live page's memory type;
 - **any combination that would be writable and executable**;
 - mapping over an existing mapping;
 - unmapping or protecting what is not mapped;
@@ -226,6 +240,8 @@ It runs before boot touches any hardware.
   the four levels;
 - entry composition and decomposition round-tripping over every valid
   permission, with the frame recovered unchanged;
+- synthetic PAT layouts and leaves covering every architectural type, reserved
+  bytes, missing PAT support, and the distinct 4 KiB and large-leaf PAT bits;
 - both sides of the physical-width bound — `PAGE_FRAME_MASK` is itself the
   highest page an entry can name and must be *accepted*; the first page above it
   must not be. **This found a real bug**: the original check compared a last byte
@@ -243,7 +259,8 @@ It runs before boot touches any hardware.
 - table-supply exhaustion, and an arena outside the identity window;
 - synthetic kernel layouts: inverted, unaligned at either end, and an image
   larger than the linked bound;
-- synthetic CPUID, CR4 and PAT values producing every processor refusal.
+- synthetic CPUID, CR4 and PAT values producing every processor refusal before
+  any real PAT MSR access.
 
 ### Normal boot
 
@@ -410,13 +427,15 @@ compiler accepts instead.
   the tables would have made the CR3 switch far harder to review.
 - **Narrowing the identity window**, and re-pointing the frame allocator, the
   ACPI readers and the table walk together.
-- **A general device cache policy.** Only the APIC windows and the VGA buffer are
-  uncacheable; the rest of the MMIO hole is still write-back.
+- **A general device cache policy.** APIC, VGA, and PCI ECAM are UC and the
+  framebuffer is WC; the rest of the MMIO hole is still write-back. A registry,
+  MTRR dump, and alias audit remain missing.
 - **Userspace, ring 3, per-process address spaces.** The user bit is refused, not
   supported.
 - **Demand paging, swap, or any fault-driven mapping.** The page-fault handler
   stays fatal.
 - **Anything per-processor.** The hierarchy is a single static and there is no
   shootdown, because there is one core.
-- **Real hardware.** Every claim here is verified under QEMU/TCG. The device
-  cacheability change in particular is the kind that fails only on iron.
+- **Real hardware.** The memory-type layer was exercised under QEMU TCG and
+  WHPX. KVM and bare metal remain open; device cacheability is the kind of change
+  that can fail only on iron.

@@ -59,7 +59,9 @@ enum paging_status {
     PAGING_STATUS_WRITE_PROTECT_INACTIVE,
     PAGING_STATUS_FIVE_LEVEL_PAGING,
     PAGING_STATUS_PHYSICAL_EXTENSION_DISABLED,
-    PAGING_STATUS_CACHE_POLICY_UNAVAILABLE,
+    PAGING_STATUS_PAT_UNSUPPORTED,
+    PAGING_STATUS_PAT_LAYOUT_UNSAFE,
+    PAGING_STATUS_PAT_READBACK_MISMATCH,
     PAGING_STATUS_BAD_KERNEL_LAYOUT,
     PAGING_STATUS_ZERO_LENGTH,
     PAGING_STATUS_UNALIGNED_ADDRESS,
@@ -67,26 +69,48 @@ enum paging_status {
     PAGING_STATUS_RANGE_OVERFLOW,
     PAGING_STATUS_PHYSICAL_TOO_WIDE,
     PAGING_STATUS_BAD_PERMISSIONS,
+    PAGING_STATUS_CONFLICTING_MEMORY_TYPES,
+    PAGING_STATUS_MEMORY_TYPE_CHANGE_UNSAFE,
     PAGING_STATUS_WRITABLE_AND_EXECUTABLE,
     PAGING_STATUS_ALREADY_MAPPED,
     PAGING_STATUS_NOT_MAPPED,
     PAGING_STATUS_HUGE_PAGE_PRESENT,
     PAGING_STATUS_OUT_OF_FRAMES,
-    PAGING_STATUS_VALIDATION_FAILURE
+    PAGING_STATUS_VALIDATION_FAILURE,
+    PAGING_STATUS_COUNT
+};
+
+/*
+ * The memory type decoded from the leaf's PAT, PCD, and PWT bits and the
+ * installed IA32_PAT value. INVALID is a real reportable outcome: translation
+ * must not guess when a PAT byte contains an architecturally reserved value.
+ */
+enum paging_memory_type {
+    PAGING_MEMORY_WRITE_BACK = 0,
+    PAGING_MEMORY_WRITE_COMBINING,
+    PAGING_MEMORY_UNCACHEABLE,
+    PAGING_MEMORY_WRITE_THROUGH,
+    PAGING_MEMORY_WRITE_PROTECTED,
+    PAGING_MEMORY_UNCACHED_MINUS,
+    PAGING_MEMORY_INVALID,
+    PAGING_MEMORY_TYPE_COUNT
 };
 
 /*
  * A mapping is described by what it permits, never by raw entry bits. Read
  * access is implied by presence, so the absence of every flag is a read-only,
- * non-executable, write-back page. There is deliberately no user flag: every
- * entry Seneri writes is supervisor-only, and a request naming an unknown bit
- * is refused rather than masked.
+ * non-executable, write-back page. UNCACHED and WRITE_COMBINING are mutually
+ * exclusive memory-type requests; naming both is refused rather than resolved
+ * by precedence. There is deliberately no user flag: every entry Seneri writes
+ * is supervisor-only, and a request naming an unknown bit is refused rather
+ * than masked.
  */
 enum paging_permissions {
     PAGING_READ = 0U,
     PAGING_WRITE = 1U << 0,
     PAGING_EXECUTE = 1U << 1,
-    PAGING_UNCACHED = 1U << 2
+    PAGING_UNCACHED = 1U << 2,
+    PAGING_WRITE_COMBINING = 1U << 3
 };
 
 struct paging_state {
@@ -102,12 +126,15 @@ struct paging_state {
     uint64_t ecam_window_base;
     uint64_t ecam_window_size;
     /*
-     * Where the framebuffer was made uncacheable, rounded down to the region
-     * it starts in, or zero when it was not mapped at all.
+     * The 4 KiB-aligned span whose pages intersect the framebuffer and were
+     * made write-combining, or zero when it was not mapped at all.
      */
     uint64_t framebuffer_base;
     uint64_t framebuffer_size;
     size_t framebuffer_regions;
+    uint64_t pat_before;
+    uint64_t pat_after;
+    unsigned int write_combining_pat_entry;
     bool no_execute_active;
     bool write_protect_active;
     bool active;
@@ -116,6 +143,7 @@ struct paging_state {
 struct paging_translation {
     uint64_t physical_address;
     uint32_t permissions;
+    enum paging_memory_type memory_type;
     unsigned int level;
 };
 
@@ -168,6 +196,7 @@ struct paging_state paging_get_state(void);
 bool paging_is_active(void);
 bool paging_self_test(void);
 const char *paging_status_string(enum paging_status status);
+const char *paging_memory_type_string(enum paging_memory_type memory_type);
 
 /*
  * Store one byte through a supervisor pointer at an instruction address a test

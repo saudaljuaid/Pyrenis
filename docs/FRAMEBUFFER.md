@@ -47,20 +47,21 @@ own name:
   channels may overlap.
 - Two framebuffer tags are refused: they cannot both be the screen.
 
-## It is device memory
+## It is a WC store destination
 
-Configuration space and APIC registers are mapped uncacheable, and so is this,
-for the same reason. `paging.c` owns the decision because `paging.c` owns the
-address space: it rounds the framebuffer out to whole 2 MiB regions and carves
-them out of the identity map as 4 KiB pages with `PAGING_WRITE |
-PAGING_UNCACHED`, exactly as it already does for the local APIC, the I/O APICs,
-the VGA buffer and the configuration window.
+The framebuffer differs from a register window: Seneri writes long sequential
+pixel runs and does not use reads as device commands. `paging.c` carves every
+4 KiB page intersecting its bytes out of the identity map with `PAGING_WRITE |
+PAGING_WRITE_COMBINING`. `IA32_PAT` entry 1 gives that request an explicit WC
+type. Configuration space, local APIC, every I/O APIC, and VGA text memory keep
+`PAGING_UNCACHED`; ordinary RAM keeps write-back. The selection and transition
+order are proved in `docs/WRITE_COMBINING.md`.
 
 The framebuffer is the first device window that is **several regions wide** —
 1024x768x32 is 3 MiB — which is why `PAGING_MAX_FRAMEBUFFER_REGIONS` exists. A
 mode larger than that bound gets no framebuffer rather than a partly mapped one:
-half a picture in device memory and half in write-back would draw correctly and
-be wrong.
+half a picture in WC memory and half in write-back would draw correctly and be
+wrong.
 
 `framebuffer_verify` re-derives this from the page tables at the end of boot,
 every page of it rather than a sample.
@@ -80,6 +81,8 @@ pitch check left the whole suite green — see the controls below.
 Normal boot reports:
 
 ```text
+Seneri OS: IA32_PAT before 0x0007040600070406 after 0x0007040600070106 entry 1 write-combining
+Seneri OS: framebuffer memory type write-combining pages 768
 Seneri OS: framebuffer 1024x768 at 0x00000000FD000000 pitch 4096 RGB 16/8/0
 Seneri OS: framebuffer verified 786432 pixels
 Seneri OS: framebuffer established
@@ -100,7 +103,7 @@ Each applied to a clean tree, rebuilt, run, and reverted.
 | Breakage | Observed failure |
 | --- | --- |
 | the row stride is taken as the width, not the pitch | `PANIC: framebuffer geometry self-test failed` |
-| the framebuffer is mapped write-back instead of uncacheable | `ST FAIL framebuffer: framebuffer does not match the address space` |
+| the framebuffer is mapped write-back instead of write-combining | `PANIC: framebuffer range is not write-combining` |
 | the pitch is not required to cover a row | **passed — see below**, then `PANIC: Multiboot2 parser self-test failed` |
 | an indexed framebuffer is accepted as direct colour | `PANIC: Multiboot2 parser self-test failed` |
 | the framebuffer is not cleared when a context is reset | `PANIC: Multiboot2 parser self-test failed` |
@@ -129,10 +132,6 @@ writing it.
 
 ## Deferred work
 
-- **The window is uncacheable, not write-combining.** Uncacheable is correct and
-  slow: every store is a bus cycle. Write-combining would batch them, and needs
-  a page attribute table entry set up for it — a change to `paging.c`'s memory
-  types, which deserves its own increment and its own proof.
 - **The VGA text console still mirrors output to 0xB8000.** It is invisible once
   the loader sets a graphics mode, but remains the fallback when no framebuffer
   is present. Choosing one physical output path dynamically needs a policy for
@@ -142,4 +141,6 @@ writing it.
   means a driver, which means PCI enumeration turning into device ownership.
 - **The picture is not cleared on the way out.** Boot leaves its proof pattern
   on the screen, which is the only reason there is anything to look at.
-- **Verified under QEMU only**, with the `std` VGA adapter, at one mode.
+- **Verified under QEMU only**, with the virtual standard VGA adapter at one
+  mode. TCG and WHPX were measured; KVM and a physical display controller were
+  unavailable.
