@@ -78,9 +78,9 @@ is present in `main` verbatim in `src/arch/x86_64/cpu.S` and declared in
 | `seneri-os-pci-enumeration` | #32 | open, eight commits |
 
 The other sixteen are the remains of merged or superseded pull requests. Two of
-them — `claude/seneri-acpi-pm-timer-k69tgx` (#23) and `seneri-os-c-update-2gc90u`
-(#14) — belong to pull requests closed unmerged as duplicates, and their content
-reached `main` through #24 and #17 respectively. `git cherry` agrees.
+them belong to pull requests closed unmerged as duplicates — #23 and #14 — and
+their content reached `main` through #24 and #17 respectively. `git cherry`
+agrees.
 
 **They are gone.** All sixteen were deleted in one push once the census above
 had been checked three ways; the commits remain recoverable from each pull
