@@ -21,6 +21,7 @@
 #include <seneri/pm_timer.h>
 #include <seneri/self_test.h>
 #include <seneri/test.h>
+#include <seneri/thread.h>
 #include <seneri/timer.h>
 #include <seneri/tsc.h>
 
@@ -48,6 +49,15 @@
  * be held to a tight tolerance rather than a generous one.
  */
 #define SLEEP_PROOF_NS UINT64_C(50000000)
+
+/*
+ * Three threads, four rounds each. Three is the smallest number that can tell a
+ * rotation from a ping-pong, and four rounds is enough that a scheduler which
+ * gets the first pass right and then loses a thread is caught.
+ */
+#define THREAD_PROOF_THREADS 3U
+#define THREAD_PROOF_ROUNDS 4U
+#define THREAD_PROOF_LOG (THREAD_PROOF_THREADS * THREAD_PROOF_ROUNDS)
 
 _Noreturn void kernel_main(uint32_t magic, uintptr_t boot_information);
 
@@ -1114,6 +1124,206 @@ static void bring_up_pci(void)
     }
 }
 
+/*
+ * Written inside three separate threads, on three separate stacks, and read
+ * back on a fourth. Volatile because the only thing that orders these writes is
+ * the switch between the threads making them, which the compiler cannot see.
+ */
+static volatile uint8_t thread_rotation[THREAD_PROOF_LOG];
+static volatile size_t thread_rotation_length;
+
+static void proof_worker(void *context)
+{
+    const uint64_t label = (uint64_t)(uintptr_t)context;
+
+    for (unsigned int round = 0; round < THREAD_PROOF_ROUNDS; ++round) {
+        if (thread_rotation_length < THREAD_PROOF_LOG) {
+            thread_rotation[thread_rotation_length] = (uint8_t)label;
+            thread_rotation_length += 1U;
+        }
+
+        thread_yield();
+    }
+
+    /*
+     * Returning is how a thread ends. The trampoline turns it into
+     * thread_exit, so there is deliberately nothing here to say so.
+     */
+}
+
+/*
+ * Turn one thread of control into several.
+ *
+ * Everything below this layer runs on the single stack boot.S set up, so every
+ * wait blocks the machine. This is the increment that makes a wait belong to
+ * something: three threads created from the heap and the page tables, each on
+ * its own guarded stack, rotating through a shared log in an order the
+ * scheduler fixes rather than one the hardware happens to produce.
+ *
+ * The order is asserted exactly. A scheduler that runs everything eventually
+ * but not in the order it claims is a scheduler whose behaviour no caller can
+ * reason about, and "all three threads ran" would not have caught it.
+ */
+static void prove_threads(void)
+{
+    struct frame_allocator_stats before;
+    struct frame_allocator_stats after;
+    struct thread_system_state threads;
+    struct thread_state_report report;
+    uint64_t identifiers[THREAD_PROOF_THREADS];
+    enum thread_status status;
+
+    before = frame_allocator_get_stats();
+    status = thread_start();
+
+    if (status != THREAD_STATUS_OK) {
+        console_panic(thread_status_string(status));
+    }
+
+    if (thread_start() != THREAD_STATUS_ALREADY_STARTED) {
+        console_panic("threads accepted a second start");
+    }
+
+    for (size_t index = 0; index < THREAD_PROOF_THREADS; ++index) {
+        status = thread_create(
+            proof_worker,
+            (void *)(uintptr_t)(index + 1U),
+            &identifiers[index]
+        );
+
+        if (status != THREAD_STATUS_OK) {
+            console_panic(thread_status_string(status));
+        }
+
+        if (identifiers[index] == THREAD_ID_NONE) {
+            console_panic("a created thread has no identifier");
+        }
+    }
+
+    threads = thread_get_state();
+    console_write("Seneri OS: threads online, ");
+    console_write_u64(threads.ready);
+    console_write(" ready of ");
+    console_write_u64(threads.capacity);
+    console_write(" on ");
+    console_write_u64(threads.stack_frames);
+    console_write(" stack frames\n");
+
+    /*
+     * Every created thread must sit in its own stack, above its own unmapped
+     * guard page. Checked before anything runs, because a stack that overlaps
+     * another produces a corruption rather than a fault.
+     */
+    for (size_t index = 0; index < THREAD_PROOF_THREADS; ++index) {
+        if (thread_report(identifiers[index], &report) != THREAD_STATUS_OK) {
+            console_panic("a created thread cannot be reported");
+        }
+
+        if (report.stack_base != report.guard_page + PAGING_PAGE_SIZE ||
+            report.stack_top != report.stack_base + THREAD_STACK_SIZE ||
+            report.state != THREAD_STATE_READY || report.boot_thread) {
+            console_panic("a created thread has a malformed stack");
+        }
+
+        for (size_t other = 0; other < index; ++other) {
+            struct thread_state_report earlier;
+
+            if (thread_report(identifiers[other], &earlier) !=
+                THREAD_STATUS_OK) {
+                console_panic("a created thread cannot be reported");
+            }
+
+            if (report.stack_base < earlier.stack_top &&
+                earlier.stack_base < report.stack_top) {
+                console_panic("two thread stacks overlap");
+            }
+        }
+    }
+
+    if (thread_verify() != THREAD_STATUS_OK) {
+        console_panic("thread table does not match the address space");
+    }
+
+    /*
+     * Waiting is yielding, so this is also what drives the rotation: the boot
+     * thread hands the processor on every time round the loop.
+     */
+    for (size_t index = 0; index < THREAD_PROOF_THREADS; ++index) {
+        status = thread_join(identifiers[index]);
+
+        if (status != THREAD_STATUS_OK) {
+            console_panic(thread_status_string(status));
+        }
+    }
+
+    console_write("Seneri OS: thread rotation ");
+
+    for (size_t index = 0; index < thread_rotation_length; ++index) {
+        console_write_u64(thread_rotation[index]);
+    }
+
+    console_putc('\n');
+
+    if (thread_rotation_length != THREAD_PROOF_LOG) {
+        console_panic("threads did not all run to completion");
+    }
+
+    /*
+     * The scheduler picks the next ready thread after the current one and
+     * wraps, so three threads created in order must run in that order, every
+     * round, without exception. Anything else is a different scheduler.
+     */
+    for (size_t index = 0; index < THREAD_PROOF_LOG; ++index) {
+        if (thread_rotation[index] !=
+            (uint8_t)(index % THREAD_PROOF_THREADS + 1U)) {
+            console_panic("threads did not rotate in order");
+        }
+    }
+
+    threads = thread_get_state();
+
+    if (threads.exited != THREAD_PROOF_THREADS || threads.ready != 0U) {
+        console_panic("threads did not all exit");
+    }
+
+    if (threads.current != thread_current() || !thread_is_started()) {
+        console_panic("the boot thread did not resume");
+    }
+
+    console_write("Seneri OS: threads switched ");
+    console_write_u64(threads.switches);
+    console_write(" times, ");
+    console_write_u64(threads.exited);
+    console_write(" exited\n");
+
+    if (thread_verify() != THREAD_STATUS_OK) {
+        console_panic("thread table does not match the address space");
+    }
+
+    status = thread_stop();
+
+    if (status != THREAD_STATUS_OK) {
+        console_panic(thread_status_string(status));
+    }
+
+    if (thread_is_started() || thread_current() != THREAD_ID_NONE) {
+        console_panic("threads did not stop");
+    }
+
+    /*
+     * Every stack frame and every interior page table those mappings needed has
+     * to come home, exactly as prove_paging_lifecycle requires. A scheduler that
+     * leaks a stack per thread is invisible in one boot and fatal in a long one.
+     */
+    after = frame_allocator_get_stats();
+
+    if (after.free_frames != before.free_frames) {
+        console_panic("starting and stopping threads did not return every frame");
+    }
+
+    console_write("Seneri OS: kernel threads established\n");
+}
+
 static void prove_frame_lifecycle(void)
 {
     uintptr_t first_frame;
@@ -1264,6 +1474,10 @@ _Noreturn void kernel_main(uint32_t magic, uintptr_t boot_information)
         console_panic("PCI configuration arithmetic self-test failed");
     }
 
+    if (!thread_self_test()) {
+        console_panic("thread table and stack layout self-test failed");
+    }
+
     console_write("Seneri OS: parser rejection tests passed\n");
 
     boot_status = boot_context_parse(magic, boot_information, &context);
@@ -1412,6 +1626,7 @@ _Noreturn void kernel_main(uint32_t magic, uintptr_t boot_information)
     prove_clocks_without_pit();
     prove_monotonic_time();
     bring_up_pci();
+    prove_threads();
 
     /*
      * Re-walk the installed hierarchy at the end of boot. Everything between
@@ -1453,6 +1668,7 @@ _Noreturn void kernel_main(uint32_t magic, uintptr_t boot_information)
     console_write("Seneri OS: virtual memory established\n");
     console_write("Seneri OS: kernel heap established\n");
     console_write("Seneri OS: PCI enumeration established\n");
+    console_write("Seneri OS: kernel threads passed\n");
     console_write("Seneri OS: never triple fault milestone passed\n");
 
     if (test_scenario == KERNEL_TEST_NORMAL) {

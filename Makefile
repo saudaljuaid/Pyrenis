@@ -8,7 +8,7 @@ SERIAL_LOG := $(BUILD_DIR)/serial.log
 TEST_BUILD_DIR := $(BUILD_DIR)/tests
 TEST_SCENARIOS := normal breakpoint invalid-opcode page-fault ist pit unexpected \
 	double-fault apic ioapic retired apic-timer tsc pm-timer pit-retired timers \
-	paging heap pci pci-ecam
+	paging heap pci pci-ecam threads thread-guard
 TEST_TARGETS := $(addprefix qemu-test-,$(TEST_SCENARIOS))
 
 CC := gcc
@@ -132,6 +132,8 @@ qemu-test-%: $(TEST_BUILD_DIR)/%/seneri.iso
 		heap) expected=67 ;; \
 		pci) expected=69 ;; \
 		pci-ecam) expected=71 ;; \
+		threads) expected=73 ;; \
+		thread-guard) expected=75 ;; \
 		*) echo 'unknown QEMU scenario: $*'; exit 1 ;; \
 	esac; \
 	# Only pci-ecam departs from the default machine. i440fx publishes no \
@@ -205,6 +207,10 @@ qemu-test-%: $(TEST_BUILD_DIR)/%/seneri.iso
 		  ! grep -Eq '^Seneri OS: PCI 0:0\.0 vendor 0x[0-9A-F]+ device 0x[0-9A-F]+ class 0x0*6\.0x0* ' "$$log" || \
 		  ! grep -Fq 'Seneri OS: PCI configuration space enumerated' "$$log" || \
 		  ! grep -Fq 'Seneri OS: PCI enumeration established' "$$log" || \
+		  ! grep -Eq '^Seneri OS: threads online, 3 ready of [0-9]+ on 12 stack frames$$' "$$log" || \
+		  ! grep -Fxq 'Seneri OS: thread rotation 123123123123' "$$log" || \
+		  ! grep -Eq '^Seneri OS: threads switched [1-9][0-9]* times, 3 exited$$' "$$log" || \
+		  ! grep -Fq 'Seneri OS: kernel threads established' "$$log" || \
 		  ! grep -Fq 'Seneri OS: never triple fault milestone passed' "$$log"; }; then \
 		echo 'normal scenario did not complete the integrated production path'; \
 		cat "$$log"; \
@@ -241,6 +247,15 @@ qemu-test-%: $(TEST_BUILD_DIR)/%/seneri.iso
 			grep -Fq 'Seneri OS: ACPI MCFG at' "$$log" && \
 			grep -Eq '^ST PCI window agreed on [0-9]+ registers of [0-9]+ functions across [0-9]+ buses, [0-9]+ with MSI-X$$' "$$log" && \
 			! grep -Eq '^ST PCI window agreed on [0-9]+ registers of 0 functions' "$$log" || \
+				diagnostics_ok=false ;; \
+		threads) \
+			grep -Eq '^ST THREADS created [0-9]+ switches [0-9]+ exited [0-9]+$$' "$$log" || \
+				diagnostics_ok=false ;; \
+		thread-guard) \
+			grep -Fq 'ST THREAD guard 0x0000000800005000' "$$log" && \
+			grep -Fq '  vector=14 name=page fault' "$$log" && \
+			grep -Fq '  cr2=0x0000000800005000' "$$log" && \
+			grep -Fq '  page-fault bits: P=0 W=1 U=0 RSVD=0 I=0' "$$log" || \
 				diagnostics_ok=false ;; \
 	esac; \
 	if test "$$diagnostics_ok" != true; then \

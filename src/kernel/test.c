@@ -20,6 +20,7 @@
 #include <seneri/pit.h>
 #include <seneri/pm_timer.h>
 #include <seneri/test.h>
+#include <seneri/thread.h>
 #include <seneri/timer.h>
 #include <seneri/tsc.h>
 
@@ -213,6 +214,14 @@ static enum kernel_test_scenario scenario_from_value(
         return KERNEL_TEST_PCI_ECAM;
     }
 
+    if (token_equals(value, length, "threads")) {
+        return KERNEL_TEST_THREADS;
+    }
+
+    if (token_equals(value, length, "thread-guard")) {
+        return KERNEL_TEST_THREAD_GUARD;
+    }
+
     return KERNEL_TEST_INVALID;
 }
 
@@ -259,6 +268,10 @@ static uint8_t scenario_exit_value(enum kernel_test_scenario scenario)
         return UINT8_C(0x22);
     case KERNEL_TEST_PCI_ECAM:
         return UINT8_C(0x23);
+    case KERNEL_TEST_THREADS:
+        return UINT8_C(0x24);
+    case KERNEL_TEST_THREAD_GUARD:
+        return UINT8_C(0x25);
     default:
         return QEMU_FAILURE_VALUE;
     }
@@ -2014,6 +2027,341 @@ static void pci_ecam_scenario(const struct acpi_mcfg *mcfg, bool mcfg_present)
     }
 }
 
+
+/*
+ * The guard page of the first thread this scenario creates. Slot zero belongs
+ * to the boot thread, whose stack region is never mapped, so a created thread
+ * is slot one and its guard is one stride above the region base. Written out
+ * rather than computed so the Makefile can require this exact address in the
+ * fault diagnostic - a guard that moved would otherwise still look like a pass.
+ */
+#define THREAD_GUARD_TEST_ADDRESS \
+    (THREAD_STACK_REGION + THREAD_STACK_STRIDE)
+
+/*
+ * A supervisor write to an absent page is P=0 W=1 U=0. The heap scenario takes
+ * the same error code at its own guard, and the two are told apart by CR2.
+ */
+#define THREAD_GUARD_TEST_ERROR_CODE UINT64_C(0x02)
+
+_Static_assert(
+    THREAD_GUARD_TEST_ADDRESS == UINT64_C(0x0000000800005000),
+    "the thread guard page moved and the fault diagnostic no longer matches"
+);
+
+/* Written by every scenario worker, read by the boot thread after they exit. */
+static volatile uint32_t thread_scenario_ran;
+static volatile uint64_t thread_scenario_seen[THREAD_MAX];
+
+static void scenario_worker(void *context)
+{
+    const uint64_t label = (uint64_t)(uintptr_t)context;
+
+    for (unsigned int round = 0; round < 2U; ++round) {
+        /*
+         * Recorded from inside the thread, so this is also a check that
+         * thread_current answers about the thread that is actually running
+         * rather than about whoever asked last.
+         */
+        if (label < THREAD_MAX) {
+            thread_scenario_seen[label] = thread_current();
+        }
+
+        thread_yield();
+    }
+
+    thread_scenario_ran += 1U;
+}
+
+/*
+ * The parts of the thread layer normal boot does not reach: the capacity bound,
+ * every refusal, and the teardown ordering. Normal boot proves three threads
+ * rotate; this proves the layer says no in every way it has to.
+ */
+static void threads_scenario(void)
+{
+    struct frame_allocator_stats before;
+    struct frame_allocator_stats after;
+    struct thread_system_state threads;
+    struct thread_state_report report;
+    uint64_t identifiers[THREAD_MAX];
+    uint64_t overflow = THREAD_ID_NONE;
+    uint64_t boot_identifier;
+    size_t created = 0U;
+    enum thread_status status;
+
+    if (!heap_is_active() || !paging_is_active()) {
+        kernel_test_fail("threads ran without their lower layers");
+    }
+
+    if (thread_is_started()) {
+        kernel_test_fail("threads were started before their scenario");
+    }
+
+    before = frame_allocator_get_stats();
+    status = thread_start();
+
+    if (status != THREAD_STATUS_OK) {
+        kernel_test_fail(thread_status_string(status));
+    }
+
+    boot_identifier = thread_current();
+
+    if (boot_identifier == THREAD_ID_NONE) {
+        kernel_test_fail("the boot thread was adopted without an identifier");
+    }
+
+    if (thread_report(boot_identifier, &report) != THREAD_STATUS_OK ||
+        !report.boot_thread || report.state != THREAD_STATE_RUNNING ||
+        report.stack_top != 0U) {
+        kernel_test_fail("the boot thread was not adopted as itself");
+    }
+
+    /*
+     * Fill every slot the table has. Slot zero is the boot thread's and is
+     * never handed out, so the capacity for created threads is one less than
+     * the table's - and the refusal must arrive exactly there rather than one
+     * either side of it.
+     */
+    for (size_t index = 0; index + 1U < THREAD_MAX; ++index) {
+        status = thread_create(
+            scenario_worker,
+            (void *)(uintptr_t)(index + 1U),
+            &identifiers[index]
+        );
+
+        if (status != THREAD_STATUS_OK) {
+            kernel_test_fail(thread_status_string(status));
+        }
+
+        ++created;
+    }
+
+    if (created != THREAD_MAX - 1U) {
+        kernel_test_fail("the thread table did not fill to its capacity");
+    }
+
+    if (thread_create(scenario_worker, NULL, &overflow) !=
+            THREAD_STATUS_NO_CAPACITY ||
+        overflow != THREAD_ID_NONE) {
+        kernel_test_fail("a thread was created past the table's capacity");
+    }
+
+    /* Every identifier must be distinct, or joining names the wrong thread. */
+    for (size_t index = 0; index < created; ++index) {
+        for (size_t other = index + 1U; other < created; ++other) {
+            if (identifiers[index] == identifiers[other]) {
+                kernel_test_fail("two threads share an identifier");
+            }
+        }
+
+        if (identifiers[index] == boot_identifier) {
+            kernel_test_fail("a thread reused the boot thread's identifier");
+        }
+    }
+
+    /* Refusals, each by its own name, with threads live. */
+    if (thread_join(boot_identifier) != THREAD_STATUS_BAD_IDENTIFIER) {
+        kernel_test_fail("a thread was allowed to wait for itself");
+    }
+
+    if (thread_join(UINT64_C(0xABCDEF)) != THREAD_STATUS_BAD_IDENTIFIER ||
+        thread_join(THREAD_ID_NONE) != THREAD_STATUS_BAD_IDENTIFIER) {
+        kernel_test_fail("a join accepted an identifier naming nothing");
+    }
+
+    /*
+     * Tearing down while a thread is still runnable would unmap a stack that
+     * still holds a suspended frame. It is refused, and refused before any of
+     * it happens rather than part way through.
+     */
+    if (thread_stop() != THREAD_STATUS_THREADS_STILL_RUNNABLE) {
+        kernel_test_fail("threads stopped with a thread still runnable");
+    }
+
+    threads = thread_get_state();
+
+    if (threads.ready != created || threads.stack_frames !=
+        created * THREAD_STACK_PAGES) {
+        kernel_test_fail("the thread table does not account for its stacks");
+    }
+
+    if (thread_verify() != THREAD_STATUS_OK) {
+        kernel_test_fail("thread table does not match the address space");
+    }
+
+    for (size_t index = 0; index < created; ++index) {
+        status = thread_join(identifiers[index]);
+
+        if (status != THREAD_STATUS_OK) {
+            kernel_test_fail(thread_status_string(status));
+        }
+
+        if (thread_report(identifiers[index], &report) != THREAD_STATUS_OK ||
+            report.state != THREAD_STATE_EXITED) {
+            kernel_test_fail("a joined thread had not exited");
+        }
+
+        /* Joining something that has already exited returns at once. */
+        if (thread_join(identifiers[index]) != THREAD_STATUS_OK) {
+            kernel_test_fail("joining an exited thread was refused");
+        }
+    }
+
+    if (thread_scenario_ran != created) {
+        kernel_test_fail("not every thread reached the end of its function");
+    }
+
+    /*
+     * Each worker recorded what thread_current answered while it was running.
+     * A scheduler that switched stacks but not its idea of who is current would
+     * pass every other check here.
+     */
+    for (size_t index = 0; index < created; ++index) {
+        if (thread_scenario_seen[index + 1U] != identifiers[index]) {
+            kernel_test_fail("a thread did not know which thread it was");
+        }
+    }
+
+    threads = thread_get_state();
+
+    if (threads.exited != created || threads.ready != 0U ||
+        threads.switches == 0U) {
+        kernel_test_fail("the thread table does not account for its exits");
+    }
+
+    status = thread_stop();
+
+    if (status != THREAD_STATUS_OK) {
+        kernel_test_fail(thread_status_string(status));
+    }
+
+    if (thread_is_started() ||
+        thread_stop() != THREAD_STATUS_NOT_STARTED ||
+        thread_create(scenario_worker, NULL, &overflow) !=
+            THREAD_STATUS_NOT_STARTED) {
+        kernel_test_fail("threads accepted work after stopping");
+    }
+
+    after = frame_allocator_get_stats();
+
+    if (after.free_frames != before.free_frames) {
+        kernel_test_fail("stopping threads did not return every frame");
+    }
+
+    /*
+     * The stacks are gone, so every guard and every stack page of every slot
+     * must now be absent. Checked after teardown because a stop that unmapped
+     * the guards but kept the stacks would leak silently.
+     */
+    for (size_t slot = 0; slot < THREAD_MAX; ++slot) {
+        const uint64_t guard =
+            THREAD_STACK_REGION + (uint64_t)slot * THREAD_STACK_STRIDE;
+        struct paging_translation translation;
+
+        for (uint64_t offset = 0U; offset < THREAD_STACK_STRIDE;
+             offset += PAGING_PAGE_SIZE) {
+            if (paging_translate(guard + offset, &translation) !=
+                PAGING_STATUS_NOT_MAPPED) {
+                kernel_test_fail("a thread stack outlived the scheduler");
+            }
+        }
+    }
+
+    console_write("ST THREADS created ");
+    console_write_u64(created);
+    console_write(" switches ");
+    console_write_u64(threads.switches);
+    console_write(" exited ");
+    console_write_u64(threads.exited);
+    console_putc('\n');
+}
+
+static void guard_worker(void *context)
+{
+    struct thread_state_report report;
+
+    (void)context;
+
+    if (thread_report(thread_current(), &report) != THREAD_STATUS_OK) {
+        kernel_test_fail("a running thread cannot report itself");
+    }
+
+    if (report.guard_page != THREAD_GUARD_TEST_ADDRESS) {
+        kernel_test_fail("the thread guard page is not where it should be");
+    }
+
+    if (report.stack_base != report.guard_page + PAGING_PAGE_SIZE) {
+        kernel_test_fail("the guard page does not precede the stack");
+    }
+
+    /*
+     * Written through the assembly probe for the same reason the paging and
+     * heap scenarios use it: the scenario matches the faulting instruction
+     * address exactly, and a compiler is free to move or delete an equivalent
+     * C store to memory it can prove nothing reads.
+     */
+    paging_probe_write(
+        (volatile uint8_t *)(uintptr_t)THREAD_GUARD_TEST_ADDRESS,
+        UINT8_C(0x5E)
+    );
+
+    kernel_test_fail("a thread stack guard page accepted a write");
+}
+
+/*
+ * Prove the guard by walking off the stack, exactly as the heap scenario proves
+ * its window. The claim is that the page below a thread's stack is never
+ * mapped, so a stack that runs past its own end meets a fault naming the guard
+ * rather than the next thread's frame.
+ *
+ * What this deliberately does *not* prove is a true stack overflow, where RSP
+ * itself has reached the guard. There the fault handler would need to push its
+ * own frame onto a stack that has just run out, so the page fault escalates.
+ * docs/THREADS.md records what was measured about that and what it needs.
+ */
+static void thread_guard_scenario(void)
+{
+    uint64_t identifier = THREAD_ID_NONE;
+    struct paging_translation translation;
+    enum thread_status status;
+
+    status = thread_start();
+
+    if (status != THREAD_STATUS_OK) {
+        kernel_test_fail(thread_status_string(status));
+    }
+
+    status = thread_create(guard_worker, NULL, &identifier);
+
+    if (status != THREAD_STATUS_OK) {
+        kernel_test_fail(thread_status_string(status));
+    }
+
+    /*
+     * The guard must be absent before the thread runs, or the fault the
+     * scenario is about to take would prove nothing about the guard.
+     */
+    if (paging_translate(THREAD_GUARD_TEST_ADDRESS, &translation) !=
+        PAGING_STATUS_NOT_MAPPED) {
+        kernel_test_fail("the thread guard page is mapped");
+    }
+
+    if (paging_translate(THREAD_GUARD_TEST_ADDRESS + PAGING_PAGE_SIZE,
+            &translation) != PAGING_STATUS_OK ||
+        translation.permissions != PAGING_WRITE) {
+        kernel_test_fail("the thread stack above the guard is not writable");
+    }
+
+    console_write("ST THREAD guard ");
+    console_write_hex(THREAD_GUARD_TEST_ADDRESS);
+    console_putc('\n');
+
+    /* Hands the processor to the worker, which does not come back. */
+    thread_yield();
+    kernel_test_fail("the guard thread returned from its fault");
+}
+
 void kernel_test_run(
     enum kernel_test_scenario scenario,
     const struct acpi_mcfg *mcfg,
@@ -2112,6 +2460,12 @@ void kernel_test_run(
     case KERNEL_TEST_PCI_ECAM:
         pci_ecam_scenario(mcfg, mcfg_present);
         kernel_test_pass();
+    case KERNEL_TEST_THREADS:
+        threads_scenario();
+        kernel_test_pass();
+    case KERNEL_TEST_THREAD_GUARD:
+        thread_guard_scenario();
+        kernel_test_fail("a thread stack guard page accepted a write");
     case KERNEL_TEST_DOUBLE_FAULT:
         kernel_test_double_fault_armed = 1U;
         interrupt_test_set_gate_present(14U, false);
@@ -2166,6 +2520,17 @@ bool kernel_test_handle_fatal_interrupt(const struct interrupt_frame *frame)
         matches = frame->vector == 14U &&
             frame->error_code == HEAP_TEST_FAULT_ERROR_CODE &&
             frame->cr2 == HEAP_GUARD_ABOVE &&
+            frame->rip == (uintptr_t)(const void *)paging_probe_write_site;
+        break;
+    case KERNEL_TEST_THREAD_GUARD:
+        /*
+         * The fault is taken on the created thread's own stack, so this also
+         * proves the fault path works at all on a stack this layer allocated
+         * rather than only on the one boot.S set up.
+         */
+        matches = frame->vector == 14U &&
+            frame->error_code == THREAD_GUARD_TEST_ERROR_CODE &&
+            frame->cr2 == THREAD_GUARD_TEST_ADDRESS &&
             frame->rip == (uintptr_t)(const void *)paging_probe_write_site;
         break;
     default:
@@ -2224,6 +2589,10 @@ const char *kernel_test_scenario_name(enum kernel_test_scenario scenario)
         return "pci";
     case KERNEL_TEST_PCI_ECAM:
         return "pci-ecam";
+    case KERNEL_TEST_THREADS:
+        return "threads";
+    case KERNEL_TEST_THREAD_GUARD:
+        return "thread-guard";
     case KERNEL_TEST_INVALID:
         return "invalid";
     default:

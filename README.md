@@ -72,6 +72,7 @@ Seneri OS: kernel heap established
 Seneri OS: deadline table of 32 entries on the heap
 Seneri OS: PCI configuration space enumerated
 Seneri OS: PCI enumeration established
+Seneri OS: kernel threads established
 ```
 
 ## Build and prove it
@@ -87,7 +88,7 @@ Then run:
 ```sh
 make verify   # clean build plus ELF, Multiboot2, symbol, and W^X checks
 make smoke      # run the strict normal-boot QEMU protocol
-make qemu-tests # run twenty deterministic fault, interrupt and device scenarios
+make qemu-tests # run twenty-two deterministic fault, device and thread scenarios
 make run      # optional interactive boot
 make hooks    # enforce verification in this local clone
 ```
@@ -116,6 +117,8 @@ make hooks    # enforce verification in this local clone
 - `src/kernel/paging.c` — the kernel's own page tables and the W^X guarantee.
 - `src/kernel/heap.c` — the guarded, bounded, transactional kernel heap.
 - `src/kernel/pci.c` — PCI configuration space, read two independent ways.
+- `src/kernel/thread.c` — kernel threads, guarded stacks, and the run queue.
+- `src/arch/x86_64/thread.S` — the context switch and where a new thread starts.
 - `linker.ld` — low-memory ELF layout with separate, page-aligned R, RX, and RW
   segments.
 - `docs/ACPI_TABLES.md` — firmware-table bounds, invariants, and test protocol.
@@ -134,6 +137,7 @@ make hooks    # enforce verification in this local clone
   other.
 - `docs/HARDWARE_AND_APPLICATIONS.md` — the costed route to drivers, wireless,
   and running programs.
+- `docs/THREADS.md` — more than one thread of control, and the page below each.
 - `docs/NEVER_TRIPLE_FAULT.md` — interrupt ABI, invariants, and test protocol.
 - `CONTRIBUTING.md` — non-negotiable engineering and commit rules.
 
@@ -185,14 +189,26 @@ register for register on every function inside it. The same argument the three
 clocks make, one layer up. A machine that declares no window — the default QEMU
 machine is one — is not a failure; it runs on the ports alone and says so.
 
+There is now more than one thread of control. A context switch saves the
+callee-saved registers and the flags on the stack it was called on, so changing
+the stack pointer changes which return address the final `ret` uses; every
+suspended thread is sitting inside that one function waiting to finish. Threads
+take their table from the heap and their stacks from the page tables, four pages
+each with an unmapped guard page below — so a stack that runs off either end
+meets a fault rather than a neighbour's frame — and the context this kernel
+booted on is adopted as the first thread rather than special-cased. Boot creates
+three and requires them to rotate in exactly the order the run queue promises,
+then proves every frame and every interior page table came home.
+
 What is missing sits above that layer. The heap has its first consumer — the
 deadline table is obtained from it at `timer_start` and returned at
 `timer_stop` — but the ACPI topology and the interrupt tables are still fixed
 arrays, and converting each is its own change. The heap never
 shrinks — though the page tables underneath it are now reclaimed when an unmap
-empties them — and nothing sleeps concurrently, because `timer_sleep_ns` halts the only thread of control
-there is; a second sleeper needs threads, and threads need the scheduler this
-layer exists to make possible. The kernel is still identity-mapped rather than
+empties them — and `timer_sleep_ns` still halts rather than
+blocking, so nothing sleeps concurrently yet — the threads now exist, but the
+scheduler is cooperative and a sleep does not yield to it. Making a sleep a block
+is the increment that changes that, and it needs preemption first. The kernel is still identity-mapped rather than
 higher-half, a 4 KiB change inside a 2 MiB mapping is refused rather than split,
 and the page-fault handler stays fatal: there is no demand paging. There is no
 wall-clock date, only time since boot. The supported target still reports no
@@ -206,9 +222,11 @@ uncacheable APIC mappings in particular are the kind of change that fails only
 on real hardware. No base address register is sized and no device is claimed, so the
 enumeration is a list rather than a driver; `docs/HARDWARE_AND_APPLICATIONS.md`
 costs the route from that list to storage, wireless, and running programs, and
-records why Linux driver source is not on it. It has a deliberately narrow
-single-core foundation, but no scheduler, userspace, filesystem, networking,
-graphics, or hardware drivers. Those arrive only after the previous layer has an executable
+records why Linux driver source is not on it. A thread that overflows its stack is contained by
+its guard page and the double-fault stack, but cannot yet be diagnosed as an
+overflow, because the page fault has no interrupt stack of its own. It has a
+deliberately narrow single-core foundation, with no preemption, userspace,
+filesystem, networking, graphics, or hardware drivers. Those arrive only after the previous layer has an executable
 acceptance test.
 
 Seneri OS is licensed under GPL-3.0; see `LICENSE`.
