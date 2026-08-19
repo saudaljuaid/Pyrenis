@@ -33,6 +33,7 @@ enum kernel_test_scenario {
     KERNEL_TEST_PCI_ECAM,
     KERNEL_TEST_THREADS,
     KERNEL_TEST_THREAD_GUARD,
+    KERNEL_TEST_FRAMEBUFFER,
     KERNEL_TEST_INVALID
 };
 
@@ -46,7 +47,8 @@ enum kernel_test_scenario kernel_test_select(const struct boot_context *context)
 void kernel_test_run(
     enum kernel_test_scenario scenario,
     const struct acpi_mcfg *mcfg,
-    bool mcfg_present
+    bool mcfg_present,
+    const struct boot_framebuffer *framebuffer
 );
 _Noreturn void kernel_test_complete_normal(void);
 bool kernel_test_handle_fatal_interrupt(const struct interrupt_frame *frame);

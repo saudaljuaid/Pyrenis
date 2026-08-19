@@ -24,6 +24,22 @@ multiboot_header:
     .long 16
     .long 14
     .long 15
+    /*
+     * Ask for a linear framebuffer. Tagged optional, so a loader that cannot
+     * set a graphics mode still boots this kernel and simply reports no
+     * framebuffer - the same shape as a machine that declares no MCFG. The
+     * request is a preference, not a contract: Multiboot2 3.1.10 lets the
+     * loader answer with whatever mode it actually has, so nothing downstream
+     * may assume these numbers came back.
+     */
+    .short 5
+    .short 1
+    .long 20
+    .long 1024
+    .long 768
+    .long 32
+    /* Tags are 8-byte aligned and the framebuffer request is 20 bytes long. */
+    .long 0
     .short 0
     .short 0
     .long 8

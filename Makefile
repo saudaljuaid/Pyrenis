@@ -8,7 +8,7 @@ SERIAL_LOG := $(BUILD_DIR)/serial.log
 TEST_BUILD_DIR := $(BUILD_DIR)/tests
 TEST_SCENARIOS := normal breakpoint invalid-opcode page-fault ist pit unexpected \
 	double-fault apic ioapic retired apic-timer tsc pm-timer pit-retired timers \
-	paging heap pci pci-ecam threads thread-guard
+	paging heap pci pci-ecam threads thread-guard framebuffer
 TEST_TARGETS := $(addprefix qemu-test-,$(TEST_SCENARIOS))
 
 CC := gcc
@@ -134,6 +134,7 @@ qemu-test-%: $(TEST_BUILD_DIR)/%/seneri.iso
 		pci-ecam) expected=71 ;; \
 		threads) expected=73 ;; \
 		thread-guard) expected=75 ;; \
+		framebuffer) expected=77 ;; \
 		*) echo 'unknown QEMU scenario: $*'; exit 1 ;; \
 	esac; \
 	# Only pci-ecam departs from the default machine. i440fx publishes no \
@@ -211,6 +212,9 @@ qemu-test-%: $(TEST_BUILD_DIR)/%/seneri.iso
 		  ! grep -Fxq 'Seneri OS: thread rotation 123123123123' "$$log" || \
 		  ! grep -Eq '^Seneri OS: threads switched [1-9][0-9]* times, 3 exited$$' "$$log" || \
 		  ! grep -Fq 'Seneri OS: kernel threads established' "$$log" || \
+		  ! grep -Eq '^Seneri OS: framebuffer [0-9]+x[0-9]+ at 0x[0-9A-F]+ pitch [0-9]+ RGB [0-9]+/[0-9]+/[0-9]+$$' "$$log" || \
+		  ! grep -Fxq 'Seneri OS: framebuffer verified 786432 pixels' "$$log" || \
+		  ! grep -Fq 'Seneri OS: framebuffer established' "$$log" || \
 		  ! grep -Fq 'Seneri OS: never triple fault milestone passed' "$$log"; }; then \
 		echo 'normal scenario did not complete the integrated production path'; \
 		cat "$$log"; \
@@ -250,6 +254,9 @@ qemu-test-%: $(TEST_BUILD_DIR)/%/seneri.iso
 				diagnostics_ok=false ;; \
 		threads) \
 			grep -Eq '^ST THREADS created [0-9]+ switches [0-9]+ exited [0-9]+$$' "$$log" || \
+				diagnostics_ok=false ;; \
+		framebuffer) \
+			grep -Eq '^ST FRAMEBUFFER [0-9]+x[0-9]+ probes 16 pitch [0-9]+$$' "$$log" || \
 				diagnostics_ok=false ;; \
 		thread-guard) \
 			grep -Fq 'ST THREAD guard 0x0000000800005000' "$$log" && \

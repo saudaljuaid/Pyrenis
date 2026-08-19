@@ -73,6 +73,7 @@ Seneri OS: deadline table of 32 entries on the heap
 Seneri OS: PCI configuration space enumerated
 Seneri OS: PCI enumeration established
 Seneri OS: kernel threads established
+Seneri OS: framebuffer established
 ```
 
 ## Build and prove it
@@ -88,7 +89,7 @@ Then run:
 ```sh
 make verify   # clean build plus ELF, Multiboot2, symbol, and W^X checks
 make smoke      # run the strict normal-boot QEMU protocol
-make qemu-tests # run twenty-two deterministic fault, device and thread scenarios
+make qemu-tests # run twenty-three deterministic fault, device and thread scenarios
 make run      # optional interactive boot
 make hooks    # enforce verification in this local clone
 ```
@@ -119,6 +120,7 @@ make hooks    # enforce verification in this local clone
 - `src/kernel/pci.c` — PCI configuration space, read two independent ways.
 - `src/kernel/thread.c` — kernel threads, guarded stacks, and the run queue.
 - `src/arch/x86_64/thread.S` — the context switch and where a new thread starts.
+- `src/kernel/framebuffer.c` — every pixel on the screen, and proof of each one.
 - `linker.ld` — low-memory ELF layout with separate, page-aligned R, RX, and RW
   segments.
 - `docs/ACPI_TABLES.md` — firmware-table bounds, invariants, and test protocol.
@@ -138,6 +140,7 @@ make hooks    # enforce verification in this local clone
 - `docs/HARDWARE_AND_APPLICATIONS.md` — the costed route to drivers, wireless,
   and running programs.
 - `docs/THREADS.md` — more than one thread of control, and the page below each.
+- `docs/FRAMEBUFFER.md` — pixels, and why a picture is not proof of one.
 - `docs/NEVER_TRIPLE_FAULT.md` — interrupt ABI, invariants, and test protocol.
 - `CONTRIBUTING.md` — non-negotiable engineering and commit rules.
 
@@ -200,6 +203,14 @@ booted on is adopted as the first thread rather than special-cased. Boot creates
 three and requires them to rotate in exactly the order the run queue promises,
 then proves every frame and every interior page table came home.
 
+There is also a screen. The Multiboot2 header asks the loader for a linear
+framebuffer, optionally, so a loader that cannot set a graphics mode still boots;
+what comes back is validated field by field rather than assumed, carved out of
+the identity map as uncacheable device memory across as many 2 MiB regions as it
+spans, and then proved. Boot writes a pattern whose colour is a function of the
+coordinates and reads all 786,432 pixels back, because a framebuffer looks right
+long before it is right and `CONTRIBUTING.md` says screenshots are not proof.
+
 What is missing sits above that layer. The heap has its first consumer — the
 deadline table is obtained from it at `timer_start` and returned at
 `timer_stop` — but the ACPI topology and the interrupt tables are still fixed
@@ -222,7 +233,9 @@ uncacheable APIC mappings in particular are the kind of change that fails only
 on real hardware. No base address register is sized and no device is claimed, so the
 enumeration is a list rather than a driver; `docs/HARDWARE_AND_APPLICATIONS.md`
 costs the route from that list to storage, wireless, and running programs, and
-records why Linux driver source is not on it. A thread that overflows its stack is contained by
+records why Linux driver source is not on it. There is no text on that screen: nothing yet knows what a character is, and the
+framebuffer is uncacheable rather than write-combining, so every store to it is
+a bus cycle. A thread that overflows its stack is contained by
 its guard page and the double-fault stack, but cannot yet be diagnosed as an
 overflow, because the page fault has no interrupt stack of its own. It has a
 deliberately narrow single-core foundation, with no preemption, userspace,

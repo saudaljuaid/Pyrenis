@@ -83,7 +83,51 @@ enum boot_status {
     BOOT_STATUS_DUPLICATE_ACPI_TAG,
     BOOT_STATUS_BAD_END_TAG,
     BOOT_STATUS_MISSING_END_TAG,
-    BOOT_STATUS_MISSING_MEMORY_MAP
+    BOOT_STATUS_MISSING_MEMORY_MAP,
+    BOOT_STATUS_DUPLICATE_FRAMEBUFFER,
+    BOOT_STATUS_FRAMEBUFFER_TAG_TOO_SMALL,
+    BOOT_STATUS_FRAMEBUFFER_NOT_DIRECT_COLOUR,
+    BOOT_STATUS_BAD_FRAMEBUFFER_DEPTH,
+    BOOT_STATUS_BAD_FRAMEBUFFER_GEOMETRY,
+    BOOT_STATUS_BAD_FRAMEBUFFER_PITCH,
+    BOOT_STATUS_BAD_FRAMEBUFFER_ADDRESS,
+    BOOT_STATUS_BAD_FRAMEBUFFER_CHANNEL,
+    BOOT_STATUS_FRAMEBUFFER_OUTSIDE_EARLY_MAP
+};
+
+/*
+ * Multiboot2 3.6.12 describes a framebuffer with a 32-byte common part and a
+ * colour description whose shape depends on the type. Only direct RGB is
+ * modelled: an indexed palette and EGA text are different things wearing the
+ * same tag, and Seneri refuses each by name rather than guessing.
+ */
+#define MULTIBOOT2_FRAMEBUFFER_COMMON_SIZE 32U
+#define MULTIBOOT2_FRAMEBUFFER_RGB_SIZE 38U
+#define MULTIBOOT2_FRAMEBUFFER_TYPE_INDEXED 0U
+#define MULTIBOOT2_FRAMEBUFFER_TYPE_RGB 1U
+#define MULTIBOOT2_FRAMEBUFFER_TYPE_EGA_TEXT 2U
+
+/* The only depth this kernel packs a pixel for. Anything else is refused. */
+#define BOOT_FRAMEBUFFER_BITS_PER_PIXEL 32U
+#define BOOT_FRAMEBUFFER_BYTES_PER_PIXEL (BOOT_FRAMEBUFFER_BITS_PER_PIXEL / 8U)
+
+/*
+ * What the loader actually set, which need not be what the header asked for.
+ * Multiboot2 3.1.10 makes the request a preference, so every number here is
+ * read back rather than assumed, and the geometry is validated before anything
+ * computes an address from it.
+ */
+struct boot_framebuffer {
+    uint64_t address;
+    uint32_t pitch;
+    uint32_t width;
+    uint32_t height;
+    uint64_t size;
+    uint8_t bits_per_pixel;
+    uint8_t red_position;
+    uint8_t green_position;
+    uint8_t blue_position;
+    bool present;
 };
 
 struct multiboot2_information_header {
@@ -139,6 +183,7 @@ struct boot_context {
     size_t memory_map_entry_count;
     uint64_t reported_usable_bytes;
     uint64_t highest_reported_address;
+    struct boot_framebuffer framebuffer;
 };
 
 enum boot_status boot_context_parse(

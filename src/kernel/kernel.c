@@ -10,6 +10,7 @@
 #include <seneri/clock.h>
 #include <seneri/console.h>
 #include <seneri/cpu.h>
+#include <seneri/framebuffer.h>
 #include <seneri/heap.h>
 #include <seneri/interrupts.h>
 #include <seneri/ioapic.h>
@@ -644,12 +645,14 @@ static void prove_monotonic_time(void)
  */
 static void install_page_tables(
     const struct acpi_topology *topology,
-    const struct acpi_mcfg *mcfg
+    const struct acpi_mcfg *mcfg,
+    const struct boot_framebuffer *framebuffer
 )
 {
     struct paging_state paging;
     struct paging_audit audit;
-    enum paging_status status = paging_initialize(topology, mcfg);
+    enum paging_status status =
+        paging_initialize(topology, mcfg, framebuffer);
 
     if (status != PAGING_STATUS_OK) {
         console_panic(paging_status_string(status));
@@ -1324,6 +1327,135 @@ static void prove_threads(void)
     console_write("Seneri OS: kernel threads established\n");
 }
 
+/*
+ * Put the picture on the screen, and prove every pixel of it.
+ *
+ * CONTRIBUTING.md says screenshots are not proof, and this is the first layer
+ * where that is a temptation rather than a slogan: a framebuffer looks right
+ * long before it is right. So the colour of each pixel is a function of its
+ * coordinates, and every one is read back. A pitch mistaken for a width shears
+ * the image, two coordinates that alias give one of them the wrong colour, and
+ * a mapping that stopped short faults - none of which a picture would report.
+ */
+static uint32_t proof_colour(uint32_t x, uint32_t y)
+{
+    return framebuffer_pack(
+        (uint8_t)x,
+        (uint8_t)y,
+        (uint8_t)(x ^ y)
+    );
+}
+
+static void prove_framebuffer(const struct boot_framebuffer *framebuffer)
+{
+    struct framebuffer_state screen;
+    const uint32_t mask = framebuffer_visible_mask();
+    uint64_t checked = 0U;
+    enum framebuffer_status status = framebuffer_initialize(framebuffer);
+
+    /*
+     * A loader that set no graphics mode is not a failure. Seneri has run on
+     * the serial console since day one and continues to; this says so and moves
+     * on, the same shape as a machine that declares no MCFG.
+     */
+    if (status == FRAMEBUFFER_STATUS_ABSENT) {
+        console_write("Seneri OS: no framebuffer, serial console only\n");
+        return;
+    }
+
+    if (status != FRAMEBUFFER_STATUS_OK) {
+        console_panic(framebuffer_status_string(status));
+    }
+
+    screen = framebuffer_get_state();
+    console_write("Seneri OS: framebuffer ");
+    console_write_u64(screen.width);
+    console_putc('x');
+    console_write_u64(screen.height);
+    console_write(" at ");
+    console_write_hex(screen.address);
+    console_write(" pitch ");
+    console_write_u64(screen.pitch);
+    console_write(" RGB ");
+    console_write_u64(screen.red_position);
+    console_putc('/');
+    console_write_u64(screen.green_position);
+    console_putc('/');
+    console_write_u64(screen.blue_position);
+    console_putc('\n');
+
+    if (framebuffer_initialize(framebuffer) !=
+        FRAMEBUFFER_STATUS_ALREADY_INITIALIZED) {
+        console_panic("the framebuffer accepted a second initialization");
+    }
+
+    /*
+     * Clear first, so that a pattern which fails to reach some pixel is caught
+     * as the clear colour rather than as whatever the loader happened to leave.
+     */
+    if (framebuffer_fill(framebuffer_pack(0U, 0U, 0U)) !=
+        FRAMEBUFFER_STATUS_OK) {
+        console_panic("the framebuffer would not clear");
+    }
+
+    for (uint32_t y = 0; y < screen.height; ++y) {
+        for (uint32_t x = 0; x < screen.width; ++x) {
+            if (framebuffer_write_pixel(x, y, proof_colour(x, y)) !=
+                FRAMEBUFFER_STATUS_OK) {
+                console_panic("the framebuffer refused a visible pixel");
+            }
+        }
+    }
+
+    /*
+     * Read every one back. Only the bits the loader called channels are
+     * compared: the fourth byte of a 32-bit pixel is not a channel it
+     * described, so nothing is claimed about what the hardware keeps there.
+     */
+    for (uint32_t y = 0; y < screen.height; ++y) {
+        for (uint32_t x = 0; x < screen.width; ++x) {
+            uint32_t pixel = 0U;
+
+            if (framebuffer_read_pixel(x, y, &pixel) !=
+                FRAMEBUFFER_STATUS_OK) {
+                console_panic("the framebuffer refused a visible pixel");
+            }
+
+            if ((pixel & mask) != (proof_colour(x, y) & mask)) {
+                console_panic("a framebuffer pixel did not hold its colour");
+            }
+
+            ++checked;
+        }
+    }
+
+    console_write("Seneri OS: framebuffer verified ");
+    console_write_u64(checked);
+    console_write(" pixels\n");
+
+    if (checked != (uint64_t)screen.width * screen.height) {
+        console_panic("the framebuffer proof skipped part of the picture");
+    }
+
+    /*
+     * One coordinate past each edge must be refused rather than written. This
+     * is the check between a bounded framebuffer and a stray store into the
+     * page after the picture.
+     */
+    if (framebuffer_write_pixel(screen.width, 0U, 0U) !=
+            FRAMEBUFFER_STATUS_OUT_OF_BOUNDS ||
+        framebuffer_write_pixel(0U, screen.height, 0U) !=
+            FRAMEBUFFER_STATUS_OUT_OF_BOUNDS) {
+        console_panic("the framebuffer accepted a pixel off the screen");
+    }
+
+    if (framebuffer_verify() != FRAMEBUFFER_STATUS_OK) {
+        console_panic("the framebuffer is not device memory");
+    }
+
+    console_write("Seneri OS: framebuffer established\n");
+}
+
 static void prove_frame_lifecycle(void)
 {
     uintptr_t first_frame;
@@ -1478,6 +1610,10 @@ _Noreturn void kernel_main(uint32_t magic, uintptr_t boot_information)
         console_panic("thread table and stack layout self-test failed");
     }
 
+    if (!framebuffer_self_test()) {
+        console_panic("framebuffer geometry self-test failed");
+    }
+
     console_write("Seneri OS: parser rejection tests passed\n");
 
     boot_status = boot_context_parse(magic, boot_information, &context);
@@ -1585,7 +1721,7 @@ _Noreturn void kernel_main(uint32_t magic, uintptr_t boot_information)
      * executes on the kernel's own hierarchy rather than on boot.S's.
      */
     install_page_tables(&boot_topology,
-        boot_mcfg_present ? &boot_mcfg : NULL);
+        boot_mcfg_present ? &boot_mcfg : NULL, &context.framebuffer);
     prove_paging_lifecycle();
     bring_up_heap();
     prove_heap_lifecycle();
@@ -1594,7 +1730,7 @@ _Noreturn void kernel_main(uint32_t magic, uintptr_t boot_information)
     console_write("Seneri OS: memory foundation passed\n");
     test_scenario = kernel_test_select(&context);
     kernel_test_run(test_scenario, boot_mcfg_present ? &boot_mcfg : NULL,
-        boot_mcfg_present);
+        boot_mcfg_present, &context.framebuffer);
 
     if (!interrupt_breakpoint_self_test()) {
         console_panic("breakpoint register self-test failed");
@@ -1627,6 +1763,7 @@ _Noreturn void kernel_main(uint32_t magic, uintptr_t boot_information)
     prove_monotonic_time();
     bring_up_pci();
     prove_threads();
+    prove_framebuffer(&context.framebuffer);
 
     /*
      * Re-walk the installed hierarchy at the end of boot. Everything between
@@ -1669,6 +1806,7 @@ _Noreturn void kernel_main(uint32_t magic, uintptr_t boot_information)
     console_write("Seneri OS: kernel heap established\n");
     console_write("Seneri OS: PCI enumeration established\n");
     console_write("Seneri OS: kernel threads passed\n");
+    console_write("Seneri OS: framebuffer passed\n");
     console_write("Seneri OS: never triple fault milestone passed\n");
 
     if (test_scenario == KERNEL_TEST_NORMAL) {

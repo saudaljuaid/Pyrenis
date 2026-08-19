@@ -4,10 +4,12 @@ How Seneri gets real hardware and real programs, and what each route actually
 costs. This document decides direction; it implements nothing.
 
 The short version: **for applications, copy Linux's interface and none of its
-code. For drivers, do not copy Linux at all — build the standardised class
-drivers, which cover most hardware with one implementation each, and put drivers
-in userspace so a driver's licence and a driver's bugs both stay outside the
-kernel.**
+code. For drivers, build the standardised class drivers, which cover most
+hardware with one implementation each, and put drivers in userspace so a
+driver's licence and a driver's bugs both stay outside the kernel.** Borrowing
+Linux driver source is possible more often than it first looks - much of it is
+dual-licensed - but almost never for the drivers you would most want it for, and
+section 3 explains why.
 
 ## 1. The licence, which decides more than the engineering
 
@@ -19,11 +21,19 @@ not offer "or any later version". GPL-2.0-only and GPL-3.0-only are mutually
 incompatible: neither licence's conditions can be satisfied while also obeying
 the other, so a combined work cannot be distributed under either.
 
-The consequence is concrete and it removes an option that would otherwise look
-attractive:
+The consequence is concrete, but it is **narrower than it first appears**, and
+an earlier draft of this document overstated it. The correct statement is:
 
-> **Linux driver source cannot be compiled into the Seneri kernel.** Not
-> "difficult" — not permitted, no matter how good the shim layer is.
+> **A GPL-2.0-only file cannot be compiled into the Seneri kernel.** Not
+> "difficult" - not permitted, no matter how good the shim layer is.
+>
+> But **not every file in Linux is GPL-2.0-only.** A great deal of it,
+> including much of what hardware vendors contribute, is dual-licensed
+> `GPL-2.0 OR BSD-3-Clause`, and the BSD-3-Clause option **is** compatible with
+> GPL-3.0. Whether a given driver may be used is a per-file question answered by
+> its SPDX line, not a blanket rule.
+
+Section 3 works that correction through on the case where it matters most.
 
 It is worth being precise about why the obvious counter-example does not apply.
 FreeBSD runs Linux Wi-Fi drivers through LinuxKPI, and that works because the
@@ -43,9 +53,13 @@ Three ways out, and only the third needs no permission:
    more defensible separate work than one linked into `seneri.elf`. This is the
    userspace-driver argument in section 5, and it happens to be the right
    architecture regardless of licensing.
-3. **Do not use Linux driver source.** Write against the public hardware
-   specifications instead. For a surprising amount of modern hardware this costs
-   less than the shim layer would have.
+3. **Check the SPDX line before assuming either way.** A dual-licensed
+   `GPL-2.0 OR BSD-3-Clause` file may be taken under its BSD option; a
+   GPL-2.0-only file may not. Then ask the second question, which is usually the
+   one that actually decides it: does the file stand alone, or does it call into
+   a GPL-2.0-only subsystem? Where neither works, write against the public
+   hardware specifications - for a surprising amount of modern hardware that
+   costs less than the shim layer would have.
 
 An important distinction that is often blurred: **firmware blobs are not driver
 source.** Nearly every modern Wi-Fi and GPU part needs a vendor firmware image
@@ -108,6 +122,52 @@ Wi-Fi is four problems, not one:
 
 Only the first is what people picture when they say "Wi-Fi driver". The third
 and fourth are where the years go.
+
+### Intel, specifically, and why "open source" is not one question
+
+Intel's Linux wireless driver is genuinely open source, and that deserves to be
+stated precisely, because the obvious conclusion from it is wrong.
+
+`drivers/net/wireless/intel/iwlwifi/` carries
+`// SPDX-License-Identifier: GPL-2.0 OR BSD-3-Clause`. Under the BSD-3-Clause
+option that source **could** legally be used by a GPL-3.0 kernel. The licence is
+not the blocker for the driver.
+
+The blocker is what sits underneath it. `iwlwifi` is a **SoftMAC** driver: it is
+the bottom third of a stack, and it calls into `mac80211` and `cfg80211` for
+everything above the radio. Those carry
+`// SPDX-License-Identifier: GPL-2.0-only`, with no second option. So the
+roughly 100k lines that actually implement 802.11 - the part nobody wants to
+write - are exactly the part that cannot be taken.
+
+Two further facts complete the picture:
+
+- **Intel does not publish register-level programming documentation for its
+  Wi-Fi parts.** For its Ethernet controllers and its GPUs it publishes full
+  programmer's reference manuals, and clean-room implementation from those is
+  entirely practical. For Wi-Fi the driver source *is* the documentation, which
+  makes "read the GPL-2.0-only stack and write your own" the legally riskiest
+  route of the three rather than the safest.
+- **The firmware is a closed binary either way.** Intel's wireless firmware is
+  redistributable as part of an open-source operating system and explicitly may
+  not be modified or reverse engineered. That is workable - loading a firmware
+  image is not a derived work of it - but the openness stops at the hardware
+  boundary regardless of what the driver source says.
+
+So "is Intel open source?" is really four questions, and Intel Wi-Fi answers
+them differently:
+
+| Question | Intel Wi-Fi | Intel Ethernet | Intel GPU |
+| --- | --- | --- | --- |
+| Driver source published | yes | yes | yes |
+| Driver licence usable here | **yes**, via the BSD option | yes | yes |
+| Usable standalone | **no** - needs GPL-2.0-only `mac80211` | yes | mostly |
+| Register documentation published | **no** | yes | yes |
+
+The paradox is real: Intel Wi-Fi is open source and is still the worst target on
+this list, because the openness runs out exactly where the difficulty starts.
+Intel Ethernet and Intel GPUs are, by contrast, among the best-documented
+hardware available, and both are proper clean-room targets.
 
 ### The decision that removes most of the work
 
@@ -247,7 +307,11 @@ executable failure test, and a boot that proves it or refuses.
 
 ## 7. What not to do
 
-- **Do not port Linux drivers.** Section 1: not permitted, at any effort level.
+- **Do not assume a Linux driver is off limits, and do not assume it is
+  available.** Read its SPDX line, then ask what it depends on. `iwlwifi` is
+  dual-licensed and therefore usable; the `mac80211` stack it cannot work
+  without is GPL-2.0-only and therefore is not. The dependency decided it, not
+  the driver's own licence.
 - **Do not build a Linux kernel module ABI.** It buys nothing the syscall ABI
   does not, and it re-imports the licence problem.
 - **Do not start with a SoftMAC Wi-Fi part.** It hides a 100k-line 802.11 stack
@@ -268,6 +332,12 @@ executable failure test, and a boot that proves it or refuses.
 - **Which FullMAC part.** This needs a survey of what is actually purchasable
   with documentation and redistributable firmware, and that survey should happen
   before step 6 fixes the bus choice.
+- **Whether any FullMAC driver is both dual-licensed and standalone.** The
+  `iwlwifi` finding says this is worth checking per driver rather than assumed.
+  A FullMAC driver talks to firmware over a vendor command interface rather than
+  to `mac80211`, so it is far likelier to stand alone than a SoftMAC one - which
+  would leave the licence as the only question, and that one is answerable by
+  reading a single line.
 - **IOMMU.** Userspace drivers are containable only with one. Until then a
   userspace driver is isolated from the kernel's *instructions* but not from its
   *memory*, and saying so honestly matters more than the isolation does.

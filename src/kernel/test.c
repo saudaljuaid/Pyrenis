@@ -10,6 +10,7 @@
 #include <seneri/clock.h>
 #include <seneri/console.h>
 #include <seneri/cpu.h>
+#include <seneri/framebuffer.h>
 #include <seneri/heap.h>
 #include <seneri/interrupts.h>
 #include <seneri/ioapic.h>
@@ -222,6 +223,10 @@ static enum kernel_test_scenario scenario_from_value(
         return KERNEL_TEST_THREAD_GUARD;
     }
 
+    if (token_equals(value, length, "framebuffer")) {
+        return KERNEL_TEST_FRAMEBUFFER;
+    }
+
     return KERNEL_TEST_INVALID;
 }
 
@@ -272,6 +277,8 @@ static uint8_t scenario_exit_value(enum kernel_test_scenario scenario)
         return UINT8_C(0x24);
     case KERNEL_TEST_THREAD_GUARD:
         return UINT8_C(0x25);
+    case KERNEL_TEST_FRAMEBUFFER:
+        return UINT8_C(0x26);
     default:
         return QEMU_FAILURE_VALUE;
     }
@@ -1300,7 +1307,7 @@ static void paging_scenario(void)
         kernel_test_fail("a 2 MiB mapping accepted a 4 KiB change");
     }
 
-    if (paging_initialize(&paging_probe_topology, NULL) !=
+    if (paging_initialize(&paging_probe_topology, NULL, NULL) !=
         PAGING_STATUS_ALREADY_INITIALIZED) {
         kernel_test_fail("page tables accepted a second installation");
     }
@@ -2362,10 +2369,193 @@ static void thread_guard_scenario(void)
     kernel_test_fail("the guard thread returned from its fault");
 }
 
+
+/*
+ * Sixteen coordinates chosen to hit every edge and a few interior points,
+ * rather than a sweep. Normal boot already reads every pixel back through the
+ * framebuffer's own addressing; what this scenario adds is a second, completely
+ * independent addressing to compare it against, and that only needs to
+ * disagree once.
+ */
+#define FRAMEBUFFER_TEST_PROBES 16U
+
+/*
+ * The same picture addressed two ways.
+ *
+ * Normal boot proves that what framebuffer_write_pixel writes,
+ * framebuffer_read_pixel reads - which is true even if both agree on the wrong
+ * address. This computes the physical address of a coordinate from the loader's
+ * own numbers, reads it through a raw volatile pointer that shares no code with
+ * framebuffer.c, and requires the two to agree. It is the same argument the two
+ * PCI configuration mechanisms make, one layer up.
+ */
+static void framebuffer_scenario(const struct boot_framebuffer *framebuffer)
+{
+    struct framebuffer_state screen;
+    uint32_t coordinates[FRAMEBUFFER_TEST_PROBES][2];
+    uint32_t mask;
+    size_t probes = 0U;
+    enum framebuffer_status status;
+
+    if (framebuffer == NULL || !framebuffer->present) {
+        kernel_test_fail("the boot loader set no framebuffer");
+    }
+
+    if (!paging_is_active()) {
+        kernel_test_fail("the framebuffer scenario ran before paging");
+    }
+
+    status = framebuffer_initialize(framebuffer);
+
+    if (status != FRAMEBUFFER_STATUS_OK) {
+        kernel_test_fail(framebuffer_status_string(status));
+    }
+
+    screen = framebuffer_get_state();
+    mask = framebuffer_visible_mask();
+
+    if (screen.width < 4U || screen.height < 4U) {
+        kernel_test_fail("the framebuffer is too small to probe");
+    }
+
+    /* Four corners, four edge midpoints, and the rest spread through it. */
+    coordinates[probes][0] = 0U;
+    coordinates[probes++][1] = 0U;
+    coordinates[probes][0] = screen.width - 1U;
+    coordinates[probes++][1] = 0U;
+    coordinates[probes][0] = 0U;
+    coordinates[probes++][1] = screen.height - 1U;
+    coordinates[probes][0] = screen.width - 1U;
+    coordinates[probes++][1] = screen.height - 1U;
+    coordinates[probes][0] = screen.width / 2U;
+    coordinates[probes++][1] = 0U;
+    coordinates[probes][0] = screen.width / 2U;
+    coordinates[probes++][1] = screen.height - 1U;
+    coordinates[probes][0] = 0U;
+    coordinates[probes++][1] = screen.height / 2U;
+    coordinates[probes][0] = screen.width - 1U;
+    coordinates[probes++][1] = screen.height / 2U;
+
+    while (probes < FRAMEBUFFER_TEST_PROBES) {
+        coordinates[probes][0] =
+            (uint32_t)(probes * 37U) % screen.width;
+        coordinates[probes][1] =
+            (uint32_t)(probes * 53U) % screen.height;
+        ++probes;
+    }
+
+    /*
+     * A distinct colour per probe, so a coordinate that aliases another shows
+     * up as the wrong colour rather than as a coincidence.
+     */
+    for (size_t index = 0; index < probes; ++index) {
+        const uint32_t colour = framebuffer_pack(
+            (uint8_t)(index * 7U + 1U),
+            (uint8_t)(index * 11U + 2U),
+            (uint8_t)(index * 13U + 3U)
+        );
+
+        if (framebuffer_write_pixel(coordinates[index][0],
+                coordinates[index][1], colour) != FRAMEBUFFER_STATUS_OK) {
+            kernel_test_fail("the framebuffer refused a visible pixel");
+        }
+    }
+
+    for (size_t index = 0; index < probes; ++index) {
+        const uint32_t x = coordinates[index][0];
+        const uint32_t y = coordinates[index][1];
+        const uint32_t colour = framebuffer_pack(
+            (uint8_t)(index * 7U + 1U),
+            (uint8_t)(index * 11U + 2U),
+            (uint8_t)(index * 13U + 3U)
+        );
+        /*
+         * Computed here from the loader's own pitch, not from framebuffer.c.
+         * If this file and that one disagree about where a pixel lives, this is
+         * where it surfaces.
+         */
+        const volatile uint32_t *raw = (const volatile uint32_t *)(uintptr_t)(
+            framebuffer->address +
+            (uint64_t)y * framebuffer->pitch +
+            (uint64_t)x * FRAMEBUFFER_BYTES_PER_PIXEL);
+        uint32_t through_api = 0U;
+
+        if (framebuffer_read_pixel(x, y, &through_api) !=
+            FRAMEBUFFER_STATUS_OK) {
+            kernel_test_fail("the framebuffer refused a visible pixel");
+        }
+
+        if ((through_api & mask) != (colour & mask)) {
+            kernel_test_fail("a framebuffer pixel did not hold its colour");
+        }
+
+        if ((*raw & mask) != (colour & mask)) {
+            kernel_test_fail("the framebuffer wrote a pixel somewhere else");
+        }
+    }
+
+    /*
+     * No two probes may share an address. A pitch read as a width collapses
+     * rows onto each other, which every single-pixel check above would survive.
+     */
+    for (size_t left = 0; left < probes; ++left) {
+        for (size_t right = left + 1U; right < probes; ++right) {
+            const uint64_t first =
+                (uint64_t)coordinates[left][1] * framebuffer->pitch +
+                (uint64_t)coordinates[left][0] * FRAMEBUFFER_BYTES_PER_PIXEL;
+            const uint64_t second =
+                (uint64_t)coordinates[right][1] * framebuffer->pitch +
+                (uint64_t)coordinates[right][0] * FRAMEBUFFER_BYTES_PER_PIXEL;
+
+            if (coordinates[left][0] == coordinates[right][0] &&
+                coordinates[left][1] == coordinates[right][1]) {
+                continue;
+            }
+
+            if (first == second) {
+                kernel_test_fail("two framebuffer coordinates share an address");
+            }
+        }
+    }
+
+    /* The last visible pixel must still be inside the mapped span. */
+    if ((uint64_t)(screen.height - 1U) * screen.pitch +
+            (uint64_t)(screen.width - 1U) * FRAMEBUFFER_BYTES_PER_PIXEL +
+            FRAMEBUFFER_BYTES_PER_PIXEL > screen.size) {
+        kernel_test_fail("the last pixel lies outside the framebuffer");
+    }
+
+    if (framebuffer_write_pixel(screen.width, 0U, 0U) !=
+            FRAMEBUFFER_STATUS_OUT_OF_BOUNDS ||
+        framebuffer_write_pixel(0U, screen.height, 0U) !=
+            FRAMEBUFFER_STATUS_OUT_OF_BOUNDS ||
+        framebuffer_write_pixel(UINT32_MAX, UINT32_MAX, 0U) !=
+            FRAMEBUFFER_STATUS_OUT_OF_BOUNDS) {
+        kernel_test_fail("the framebuffer accepted a pixel off the screen");
+    }
+
+    status = framebuffer_verify();
+
+    if (status != FRAMEBUFFER_STATUS_OK) {
+        kernel_test_fail(framebuffer_status_string(status));
+    }
+
+    console_write("ST FRAMEBUFFER ");
+    console_write_u64(screen.width);
+    console_putc('x');
+    console_write_u64(screen.height);
+    console_write(" probes ");
+    console_write_u64(probes);
+    console_write(" pitch ");
+    console_write_u64(screen.pitch);
+    console_putc('\n');
+}
+
 void kernel_test_run(
     enum kernel_test_scenario scenario,
     const struct acpi_mcfg *mcfg,
-    bool mcfg_present
+    bool mcfg_present,
+    const struct boot_framebuffer *framebuffer
 )
 {
     enum pit_status pit_status;
@@ -2466,6 +2656,9 @@ void kernel_test_run(
     case KERNEL_TEST_THREAD_GUARD:
         thread_guard_scenario();
         kernel_test_fail("a thread stack guard page accepted a write");
+    case KERNEL_TEST_FRAMEBUFFER:
+        framebuffer_scenario(framebuffer);
+        kernel_test_pass();
     case KERNEL_TEST_DOUBLE_FAULT:
         kernel_test_double_fault_armed = 1U;
         interrupt_test_set_gate_present(14U, false);
@@ -2593,6 +2786,8 @@ const char *kernel_test_scenario_name(enum kernel_test_scenario scenario)
         return "threads";
     case KERNEL_TEST_THREAD_GUARD:
         return "thread-guard";
+    case KERNEL_TEST_FRAMEBUFFER:
+        return "framebuffer";
     case KERNEL_TEST_INVALID:
         return "invalid";
     default:

@@ -7,6 +7,7 @@
 #include <stdint.h>
 
 #include <seneri/acpi.h>
+#include <seneri/boot.h>
 
 /*
  * Intel SDM volume 3A section 4.5 splits a canonical 48-bit virtual address
@@ -37,6 +38,15 @@
  * that is a later increment; src/kernel/pci.c reads no further than this.
  */
 #define PAGING_ECAM_WINDOW_SIZE PAGING_HUGE_PAGE_SIZE
+
+/*
+ * How many 2 MiB regions of the identity map a framebuffer may claim. Eight is
+ * 16 MiB, which covers 1920x1080 at 32 bits with room to spare; a loader that
+ * sets a mode larger than this gets no framebuffer rather than a partly mapped
+ * one. Unlike the configuration window a framebuffer is several regions wide,
+ * which is the whole reason this bound exists.
+ */
+#define PAGING_MAX_FRAMEBUFFER_REGIONS 8U
 
 enum paging_status {
     PAGING_STATUS_OK = 0,
@@ -91,6 +101,13 @@ struct paging_state {
      */
     uint64_t ecam_window_base;
     uint64_t ecam_window_size;
+    /*
+     * Where the framebuffer was made uncacheable, rounded down to the region
+     * it starts in, or zero when it was not mapped at all.
+     */
+    uint64_t framebuffer_base;
+    uint64_t framebuffer_size;
+    size_t framebuffer_regions;
     bool no_execute_active;
     bool write_protect_active;
     bool active;
@@ -126,7 +143,8 @@ struct paging_audit {
  */
 enum paging_status paging_initialize(
     const struct acpi_topology *topology,
-    const struct acpi_mcfg *mcfg
+    const struct acpi_mcfg *mcfg,
+    const struct boot_framebuffer *framebuffer
 );
 enum paging_status paging_map(
     uint64_t virtual_address,
