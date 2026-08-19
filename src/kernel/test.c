@@ -230,6 +230,16 @@ static enum kernel_test_scenario scenario_from_value(
     return KERNEL_TEST_INVALID;
 }
 
+/*
+ * The value each scenario hands to QEMU's debug exit device, which the Makefile
+ * turns into the process status it requires. They are deliberately dense and
+ * deliberately stable: a scenario that took another's value would pass as that
+ * one.
+ *
+ * 0x22 is reserved rather than used. It belongs to the ioapic-level scenario in
+ * the level-triggered routing change, which was opened against main first; the
+ * scenarios below were renumbered up so the two can land in either order.
+ */
 static uint8_t scenario_exit_value(enum kernel_test_scenario scenario)
 {
     switch (scenario) {
@@ -270,15 +280,15 @@ static uint8_t scenario_exit_value(enum kernel_test_scenario scenario)
     case KERNEL_TEST_HEAP:
         return UINT8_C(0x21);
     case KERNEL_TEST_PCI:
-        return UINT8_C(0x22);
-    case KERNEL_TEST_PCI_ECAM:
         return UINT8_C(0x23);
-    case KERNEL_TEST_THREADS:
+    case KERNEL_TEST_PCI_ECAM:
         return UINT8_C(0x24);
-    case KERNEL_TEST_THREAD_GUARD:
+    case KERNEL_TEST_THREADS:
         return UINT8_C(0x25);
-    case KERNEL_TEST_FRAMEBUFFER:
+    case KERNEL_TEST_THREAD_GUARD:
         return UINT8_C(0x26);
+    case KERNEL_TEST_FRAMEBUFFER:
+        return UINT8_C(0x27);
     default:
         return QEMU_FAILURE_VALUE;
     }

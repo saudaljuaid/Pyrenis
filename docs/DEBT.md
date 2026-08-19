@@ -39,16 +39,26 @@ become false is worse than no entry, because it is read as current.
 
 Ordered by what it costs to leave alone, not by size.
 
-### 1. Integration debt — the largest actual risk
+### 1. Integration debt — half paid
 
-Five commits and 8,602 lines sit on `seneri-os-pci-enumeration`, unmerged.
-PR #31 (`ioapic: route level-triggered sources with directed EOI`) has been open
-against `main` the whole time, and **both claim QEMU exit value `0x22`**.
-Whichever lands second needs renumbering, and the longer both wait the more of
-`Makefile`, `test.c` and `include/seneri/test.h` they will disagree about.
+**The exit-value collision is resolved.** PR #31
+(`ioapic: route level-triggered sources with directed EOI`) was opened against
+`main` first, so it keeps `0x22`; the scenarios added since were renumbered up
+to `0x23`–`0x27` and `0x22` is reserved by name in both `test.c` and the
+`Makefile`. The two changes can now land in either order without one silently
+passing as the other.
 
-Nothing about this gets cheaper with time. It is the one item here that is
-someone's decision rather than a task.
+**What remains is textual.** Measured with
+`git merge-tree --write-tree --name-only`, this branch and PR #31 both touch
+five files — `Makefile`, `README.md`, `docs/PIT_RETIREMENT.md`,
+`src/kernel/kernel.c` and `src/kernel/test.c` — in the same regions: the
+scenario list, the boot sequence, and the deferred-work paragraph both changes
+rewrite. `include/seneri/test.h` merges cleanly.
+
+None of those are semantic disagreements any more, but they are hand
+resolutions, and there are more of them every increment that lands on either
+side. **This branch merges cleanly with `main` today.** The order that costs
+least is #31 first, then this.
 
 ### 2. `kernel.c` has become the place proofs go to live
 

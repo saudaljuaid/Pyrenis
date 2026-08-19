@@ -151,6 +151,9 @@ qemu-test-%: $(TEST_BUILD_DIR)/%/seneri.iso
 	@for tool in qemu-system-x86_64 timeout grep; do \
 		command -v $$tool >/dev/null 2>&1 || { echo "missing tool: $$tool"; exit 1; }; \
 	done
+	# 0x22, which is status 69, is left unused: it belongs to the ioapic-level
+	# scenario in the level-triggered routing change, which was opened against
+	# main before these were written.
 	@case '$*' in \
 		normal) expected=33 ;; \
 		breakpoint) expected=35 ;; \
@@ -170,11 +173,11 @@ qemu-test-%: $(TEST_BUILD_DIR)/%/seneri.iso
 		timers) expected=63 ;; \
 		paging) expected=65 ;; \
 		heap) expected=67 ;; \
-		pci) expected=69 ;; \
-		pci-ecam) expected=71 ;; \
-		threads) expected=73 ;; \
-		thread-guard) expected=75 ;; \
-		framebuffer) expected=77 ;; \
+		pci) expected=71 ;; \
+		pci-ecam) expected=73 ;; \
+		threads) expected=75 ;; \
+		thread-guard) expected=77 ;; \
+		framebuffer) expected=79 ;; \
 		*) echo 'unknown QEMU scenario: $*'; exit 1 ;; \
 	esac; \
 	# Only pci-ecam departs from the default machine. i440fx publishes no \
