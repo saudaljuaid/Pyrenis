@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 190" role="img" aria-labelledby="title description">
+  <title id="title">Seneri OS</title>
+  <desc id="description">Seneri OS wordmark in a bright gradient with the words from first principles.</desc>
+  <defs>
+    <linearGradient id="seneri-gradient" x1="90" y1="30" x2="870" y2="160" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#ff5d8f"/>
+      <stop offset="0.25" stop-color="#ffb84d"/>
+      <stop offset="0.5" stop-color="#8eea22"/>
+      <stop offset="0.75" stop-color="#00dce8"/>
+      <stop offset="1" stop-color="#009ae8"/>
+    </linearGradient>
+    <filter id="soft-shadow" x="-10%" y="-20%" width="120%" height="150%">
+      <feDropShadow dx="0" dy="4" stdDeviation="4" flood-color="#000000" flood-opacity="0.18"/>
+    </filter>
+  </defs>
+  <text x="480" y="112" text-anchor="middle" fill="url(#seneri-gradient)" filter="url(#soft-shadow)"
+        font-family="Trebuchet MS, Segoe UI, Arial, sans-serif" font-size="92" font-weight="700" letter-spacing="2">Seneri OS</text>
+  <text x="480" y="158" text-anchor="middle" fill="#7d8590"
+        font-family="Segoe UI, Arial, sans-serif" font-size="20" font-weight="600" letter-spacing="8">FROM FIRST PRINCIPLES</text>
+</svg>
