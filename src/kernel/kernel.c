@@ -1961,6 +1961,27 @@ _Noreturn void kernel_main(uint32_t magic, uintptr_t boot_information)
         console_panic(pci_status_string(pci_status));
     }
 
+    /*
+     * The framebuffer is re-checked here and not only inside its own proof,
+     * because the logo is blitted after that proof runs: roughly 800,000 more
+     * stores through the same mapping. Verifying before the last thing that
+     * writes through a mapping is verifying the wrong moment, which is exactly
+     * what paging_verify and heap_verify are placed here to avoid.
+     *
+     * Threads are deliberately absent from this block. thread_stop has already
+     * run by now, so there is no table left to check; docs/THREADS.md records
+     * that thread_verify's moment is while threads exist rather than at the end
+     * of boot.
+     */
+    if (framebuffer_is_active()) {
+        const enum framebuffer_status framebuffer_status =
+            framebuffer_verify();
+
+        if (framebuffer_status != FRAMEBUFFER_STATUS_OK) {
+            console_panic(framebuffer_status_string(framebuffer_status));
+        }
+    }
+
     console_write("Seneri OS: exception probes passed\n");
     console_write("Seneri OS: PIC spurious paths passed\n");
     console_write("Seneri OS: PIT delivered eight interrupts\n");

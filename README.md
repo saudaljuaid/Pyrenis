@@ -151,6 +151,7 @@ make hooks    # enforce verification in this local clone
 - `docs/THREADS.md` — more than one thread of control, and the page below each.
 - `docs/FRAMEBUFFER.md` — pixels, and why a picture is not proof of one.
 - `docs/RUST.md` — the one component that is not C, and where that line goes.
+- `docs/DEBT.md` — a measured register of what the whole thing is carrying.
 - `docs/NEVER_TRIPLE_FAULT.md` — interrupt ABI, invariants, and test protocol.
 - `CONTRIBUTING.md` — non-negotiable engineering and commit rules.
 

@@ -201,11 +201,17 @@ above was found in the first place.
 Phase 0 is complete: the calibrated rates are now a clock and a deadline. What is
 still missing sits above this layer, not inside it.
 
-- **Nothing sleeps concurrently.** `timer_sleep_ns` halts the only thread of
-  control there is. A second sleeper needs threads, and threads need a
-  scheduler — which is what this layer exists to make possible.
-- **The table is a linear scan over fixed storage**, because there is no heap. A
-  heap turns it into a bucketed wheel and removes `TIMER_MAX_PENDING`.
+- **Nothing sleeps concurrently.** `timer_sleep_ns` halts rather than yielding.
+  ~~A second sleeper needs threads~~ — threads now exist, see `docs/THREADS.md`,
+  but the scheduler is cooperative and a sleep does not hand it the processor.
+  Making a sleep a block is what finally makes this entry false, and it needs
+  preemption first.
+- ~~**The table is a linear scan over fixed storage**, because there is no
+  heap.~~ **Half fixed.** The storage is now one kernel heap allocation made at
+  `timer_start`, so `TIMER_MAX_PENDING` is a default rather than an array bound;
+  see `docs/KERNEL_HEAP.md`. The *scan* is still linear, and turning it into a
+  bucketed wheel is still waiting for something that arms enough deadlines to
+  care.
 - **Callbacks run in interrupt context** with interrupts disabled, so they must
   not block. Deferring work to a thread needs a thread.
 - **No wall-clock time.** This is time since boot only; a date needs the ACPI
