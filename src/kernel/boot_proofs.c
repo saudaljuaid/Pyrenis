@@ -43,6 +43,7 @@
 #include <seneri/pm_timer.h>
 #include <seneri/screen.h>
 #include <seneri/self_test.h>
+#include <seneri/shell.h>
 #include <seneri/test.h>
 #include <seneri/thread.h>
 #include <seneri/timer.h>
@@ -1951,4 +1952,144 @@ void prove_keyboard(void)
     }
     console_write("\" from injected scancodes\n");
     console_write("Seneri OS: keyboard established\n");
+}
+
+/*
+ * The shell, proved end to end.
+ *
+ * Every layer under this one has been proved in isolation. This is the first
+ * proof that runs the whole chain at once, and it is worth doing that way
+ * because the chain is the product: a keystroke is worthless if it decodes
+ * correctly and never reaches a command, and a command is worthless if it runs
+ * and nothing appears.
+ *
+ * So the scancodes for "echo hi" are pushed through the 8042's own 0xD2
+ * command, taken by IRQ 1, decoded by the keyboard driver, drained out of its
+ * queue, fed to the shell one character at a time exactly as shell_run does,
+ * executed, written to the console, drawn by the screen console - and then read
+ * back out of the framebuffer, pixel by pixel, and compared against the font.
+ *
+ * Nothing in that sentence is simulated except the finger.
+ */
+void prove_shell(void)
+{
+    /* e c h o <space> h i <enter>, in scancode set 1. */
+    static const uint8_t typed[] = {
+        0x12U, 0x2EU, 0x23U, 0x18U, 0x39U, 0x23U, 0x17U, 0x1CU
+    };
+    static const char echoed[] = "echo hi";
+    static const char output[] = "hi";
+    static const char prompt[] = "seneri> ";
+
+    struct shell_state before;
+    struct shell_state after;
+    struct keyboard_event event;
+    enum shell_status status;
+    size_t fed = 0U;
+
+    status = shell_initialize();
+
+    if (status != SHELL_STATUS_OK) {
+        console_panic(shell_status_string(status));
+    }
+
+    if (!screen_is_active()) {
+        console_panic("the shell proof needs a screen to read back");
+    }
+
+    if (screen_clear() != SCREEN_STATUS_OK) {
+        console_panic("the shell proof could not clear the screen");
+    }
+
+    before = shell_get_state();
+
+    cpu_interrupt_enable();
+
+    for (size_t index = 0; index < sizeof(typed); ++index) {
+        if (keyboard_inject_scancode(typed[index]) != KEYBOARD_STATUS_OK) {
+            cpu_interrupt_disable();
+            console_panic("the shell proof could not type");
+        }
+
+        /*
+         * Drained after every key rather than at the end. The controller holds
+         * one byte, so a key that is not taken before the next is injected is a
+         * key that never happened - and this is exactly the loop shell_run
+         * runs, so proving it here proves that.
+         */
+        for (uint64_t spins = 0; spins < UINT64_C(20000000); ++spins) {
+            if (keyboard_read(&event) == KEYBOARD_STATUS_OK) {
+                if (event.pressed && event.character != '\0') {
+                    (void)shell_feed(event.character);
+                    fed += 1U;
+                }
+
+                break;
+            }
+        }
+    }
+
+    cpu_interrupt_disable();
+    after = shell_get_state();
+
+    if (fed != sizeof(typed)) {
+        console_panic("the shell did not receive every key that was typed");
+    }
+
+    if (after.lines != before.lines + 1U) {
+        console_panic("the shell did not run the line it was given");
+    }
+
+    if (after.unknown != before.unknown) {
+        console_panic("the shell did not recognise a command it has");
+    }
+
+    if (after.length != 0U) {
+        console_panic("the shell did not clear its line after running it");
+    }
+
+    /*
+     * And now the part that makes this a proof rather than a count. The screen
+     * was cleared before anything was typed, so every cell below is at a known
+     * place, and each is compared against what the font says that character
+     * looks like.
+     */
+    for (size_t index = 0; index < sizeof(echoed) - 1U; ++index) {
+        if (screen_verify_cell((uint32_t)index, 0U, echoed[index]) !=
+            SCREEN_STATUS_OK) {
+            console_panic("the shell did not echo what was typed");
+        }
+    }
+
+    for (size_t index = 0; index < sizeof(output) - 1U; ++index) {
+        if (screen_verify_cell((uint32_t)index, 1U, output[index]) !=
+            SCREEN_STATUS_OK) {
+            console_panic("the command produced no output on the screen");
+        }
+    }
+
+    for (size_t index = 0; index < sizeof(prompt) - 1U; ++index) {
+        if (screen_verify_cell((uint32_t)index, 2U, prompt[index]) !=
+            SCREEN_STATUS_OK) {
+            console_panic("the shell did not offer a prompt afterwards");
+        }
+    }
+
+    if (screen_clear() != SCREEN_STATUS_OK) {
+        console_panic("the shell proof could not clear the screen afterwards");
+    }
+
+    /*
+     * The prompt above has no newline after it, because a prompt waits. Boot is
+     * about to carry on talking, so it gets one here rather than leaving the
+     * next transcript line beginning halfway across the screen.
+     */
+    console_putc('\n');
+    console_write("Seneri OS: shell ran \"");
+    console_write(echoed);
+    console_write("\" from ");
+    console_write_u64(sizeof(typed));
+    console_write(" injected scancodes\n");
+    console_write("Seneri OS: shell output verified on screen\n");
+    console_write("Seneri OS: shell established\n");
 }

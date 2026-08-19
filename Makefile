@@ -8,7 +8,7 @@ SERIAL_LOG := $(BUILD_DIR)/serial.log
 TEST_BUILD_DIR := $(BUILD_DIR)/tests
 TEST_SCENARIOS := normal breakpoint invalid-opcode page-fault ist pit unexpected \
 	double-fault apic ioapic retired apic-timer tsc pm-timer pit-retired timers \
-	paging heap pci pci-ecam threads thread-guard framebuffer screen keyboard
+	paging heap pci pci-ecam threads thread-guard framebuffer screen keyboard shell
 TEST_TARGETS := $(addprefix qemu-test-,$(TEST_SCENARIOS))
 
 CC := gcc
@@ -191,6 +191,7 @@ qemu-test-%: $(TEST_BUILD_DIR)/%/seneri.iso
 		framebuffer) expected=79 ;; \
 		screen) expected=81 ;; \
 		keyboard) expected=83 ;; \
+		shell) expected=85 ;; \
 		*) echo 'unknown QEMU scenario: $*'; exit 1 ;; \
 	esac; \
 	# Only pci-ecam departs from the default machine. i440fx publishes no \
@@ -279,6 +280,10 @@ qemu-test-%: $(TEST_BUILD_DIR)/%/seneri.iso
 		  ! grep -Fxq 'Seneri OS: keyboard decoded "hiI" from injected scancodes' "$$log" || \
 		  ! grep -Fq 'Seneri OS: keyboard established' "$$log" || \
 		  ! grep -Fq 'Seneri OS: keyboard passed' "$$log" || \
+		  ! grep -Fxq 'Seneri OS: shell ran "echo hi" from 8 injected scancodes' "$$log" || \
+		  ! grep -Fq 'Seneri OS: shell output verified on screen' "$$log" || \
+		  ! grep -Fq 'Seneri OS: shell established' "$$log" || \
+		  ! grep -Fq 'Seneri OS: shell passed' "$$log" || \
 		  ! grep -Fq 'Seneri OS: never triple fault milestone passed' "$$log"; }; then \
 		echo 'normal scenario did not complete the integrated production path'; \
 		cat "$$log"; \

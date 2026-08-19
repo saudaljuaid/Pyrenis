@@ -101,6 +101,7 @@ long you will be in there.
 | `framebuffer.c` | 460 | The linear framebuffer, validated field by field, mapped uncached. |
 | `screen.c` | 525 | Text on the framebuffer: cells, wrapping, scrolling, and reading it back. |
 | `keyboard.c` | 728 | The 8042 and scancode set 1. The first device a person operates. |
+| `shell.c` | 657 | A command line. The first layer here that never panics. |
 | `font.c` | 39 | The C side of the font: names for what the reader can refuse. |
 | `rust/font.rs` | 276 | The glyph table reader. Rust, on the first hot path in this kernel. |
 | `logo.c` | 39 | The C side of the logo: three lines of glue. |
@@ -150,6 +151,7 @@ it happens.
     draw_logo                     the splash
     prove_screen_console          text on the screen, read back off the glass
     prove_keyboard                a scancode injected through 0xD2, decoded back
+    prove_shell                   typed, run, drawn, and read back off the glass
     paging_verify                 re-walk the tables at the end, not the middle
     heap_verify
     pci_verify

@@ -284,6 +284,25 @@ enum screen_status screen_putc(char character)
         return SCREEN_STATUS_OK;
     }
 
+    /*
+     * Backspace moves the cursor and erases nothing, which is what a terminal
+     * does: erasing is the caller's three-character sequence of back, space,
+     * back. Without this the byte falls through to the drawing path, is not
+     * covered by the font, and appears on screen as the replacement character -
+     * so every correction a person made would leave a '?' behind.
+     *
+     * It stops at the first column rather than wrapping to the end of the row
+     * above. A console that reverses over a line break has to remember how long
+     * that line was, and nothing here does.
+     */
+    if (character == '\b') {
+        if (state.column > 0U) {
+            state.column -= 1U;
+        }
+
+        return SCREEN_STATUS_OK;
+    }
+
     if (state.column >= state.columns) {
         const enum screen_status status = newline();
 

@@ -156,6 +156,8 @@ make hooks    # enforce verification in this local clone
   from.
 - `docs/KEYBOARD.md` — the first device a person operates, and how boot proves
   it without one.
+- `docs/SHELL.md` — a command line, and the first proof that runs the whole
+  chain at once.
 - `docs/DEBT.md` — a measured register of what the whole thing is carrying.
 - `docs/NEVER_TRIPLE_FAULT.md` — interrupt ABI, invariants, and test protocol.
 - `docs/MAP.md` — where every file is, what it does, and the order boot runs

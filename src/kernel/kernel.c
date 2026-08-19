@@ -39,6 +39,7 @@
 #include <seneri/pm_timer.h>
 #include <seneri/screen.h>
 #include <seneri/self_test.h>
+#include <seneri/shell.h>
 #include <seneri/test.h>
 #include <seneri/thread.h>
 #include <seneri/timer.h>
@@ -169,6 +170,10 @@ _Noreturn void kernel_main(uint32_t magic, uintptr_t boot_information)
 
     if (!keyboard_self_test()) {
         console_panic("keyboard translation self-test failed");
+    }
+
+    if (!shell_self_test()) {
+        console_panic("shell line and dispatch self-test failed");
     }
 
     /*
@@ -320,6 +325,7 @@ _Noreturn void kernel_main(uint32_t magic, uintptr_t boot_information)
      * before this, so there is nothing else holding it back.
      */
     prove_keyboard();
+    prove_shell();
 
     console_write("Seneri OS: day one passed\n");
     console_write("Seneri OS: memory foundation passed\n");
@@ -427,11 +433,18 @@ _Noreturn void kernel_main(uint32_t magic, uintptr_t boot_information)
     console_write("Seneri OS: logo passed\n");
     console_write("Seneri OS: screen console passed\n");
     console_write("Seneri OS: keyboard passed\n");
+    console_write("Seneri OS: shell passed\n");
     console_write("Seneri OS: never triple fault milestone passed\n");
 
     if (test_scenario == KERNEL_TEST_NORMAL) {
         kernel_test_complete_normal();
     }
 
-    console_halt();
+    /*
+     * With no scenario selected there is nobody waiting for this machine to
+     * stop, so it does not: boot ends by handing the console to whoever is in
+     * front of it. Every scenario, including normal, has already left above -
+     * a scenario has to finish and a shell does not.
+     */
+    shell_run();
 }

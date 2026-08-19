@@ -107,4 +107,11 @@ void prove_screen_console(void);
  */
 void prove_keyboard(void);
 
+/*
+ * The first proof that runs the whole chain at once: scancodes injected through
+ * the controller, decoded, fed to the shell, executed, drawn, and read back out
+ * of the framebuffer. Nothing in it is simulated except the finger.
+ */
+void prove_shell(void);
+
 #endif

@@ -22,6 +22,7 @@
 #include <seneri/pit.h>
 #include <seneri/keyboard.h>
 #include <seneri/screen.h>
+#include <seneri/shell.h>
 #include <seneri/pm_timer.h>
 #include <seneri/test.h>
 #include <seneri/thread.h>
@@ -226,6 +227,10 @@ static enum kernel_test_scenario scenario_from_value(
         return KERNEL_TEST_THREAD_GUARD;
     }
 
+    if (token_equals(value, length, "shell")) {
+        return KERNEL_TEST_SHELL;
+    }
+
     if (token_equals(value, length, "keyboard")) {
         return KERNEL_TEST_KEYBOARD;
     }
@@ -304,6 +309,8 @@ static uint8_t scenario_exit_value(enum kernel_test_scenario scenario)
         return UINT8_C(0x28);
     case KERNEL_TEST_KEYBOARD:
         return UINT8_C(0x29);
+    case KERNEL_TEST_SHELL:
+        return UINT8_C(0x2A);
     default:
         return QEMU_FAILURE_VALUE;
     }
@@ -2435,6 +2442,178 @@ static void thread_guard_scenario(void)
  * machine in a state the rest of boot did not ask for. Nothing after this
  * scenario needs a keyboard, so this can do both.
  */
+/*
+ * The shell, taken apart where boot cannot.
+ *
+ * prove_shell types one command and reads the answer off the glass. What it
+ * cannot do is run every command, because several of them clear the screen or
+ * print pages, and boot has to keep its transcript. Nothing after this scenario
+ * needs a console, so this can run all of them.
+ */
+static void shell_scenario(void)
+{
+    static const char *const commands[] = {
+        "help", "echo hello", "uptime", "mem", "pci", "keys", "threads",
+        "version", "clear"
+    };
+
+    struct shell_state before;
+    struct shell_state after;
+
+    if (!shell_is_active()) {
+        kernel_test_fail("the shell scenario has no shell");
+    }
+
+    before = shell_get_state();
+
+    /*
+     * Every command this shell has, run for real. A command that faults or
+     * hangs takes the scenario with it, which is the point: these read live
+     * kernel state and any of them could be pointing at something that has
+     * since moved.
+     */
+    for (size_t index = 0; index < sizeof(commands) / sizeof(commands[0]);
+         ++index) {
+        if (shell_execute(commands[index]) != SHELL_STATUS_OK) {
+            kernel_test_fail("a built-in command refused to run");
+        }
+    }
+
+    after = shell_get_state();
+
+    if (after.commands - before.commands !=
+        sizeof(commands) / sizeof(commands[0])) {
+        kernel_test_fail("the shell did not count every command it ran");
+    }
+
+    if (after.unknown != before.unknown) {
+        kernel_test_fail("the shell did not recognise one of its own commands");
+    }
+
+    /*
+     * A prefix must not run a longer command, and a longer word must not run a
+     * shorter one. Both directions, because a dispatcher that compares only as
+     * far as its own name gets one of them wrong.
+     */
+    if (shell_execute("hel") != SHELL_STATUS_UNKNOWN_COMMAND) {
+        kernel_test_fail("a prefix of a command ran that command");
+    }
+
+    if (shell_execute("helpful") != SHELL_STATUS_UNKNOWN_COMMAND) {
+        kernel_test_fail("a longer word ran a shorter command");
+    }
+
+    if (shell_execute("echoes") != SHELL_STATUS_UNKNOWN_COMMAND) {
+        kernel_test_fail("a longer word ran echo");
+    }
+
+    /*
+     * The line editor, driven the way a person drives it. Typed, corrected with
+     * backspace, and submitted - and the correction has to have taken, which
+     * only the command that runs can show.
+     */
+    before = shell_get_state();
+
+    {
+        static const char typed[] = "echa\bo corrected";
+
+        for (size_t index = 0; typed[index] != '\0'; ++index) {
+            if (shell_feed(typed[index]) != SHELL_STATUS_OK) {
+                kernel_test_fail("the shell refused a character while typing");
+            }
+        }
+
+        if (shell_feed('\n') != SHELL_STATUS_OK) {
+            kernel_test_fail("the corrected line did not run");
+        }
+    }
+
+    after = shell_get_state();
+
+    if (after.unknown != before.unknown) {
+        kernel_test_fail("backspace did not correct the command");
+    }
+
+    if (after.length != 0U) {
+        kernel_test_fail("the shell kept the line after running it");
+    }
+
+    /*
+     * An erase has to reach the glass, not only the buffer.
+     *
+     * This exists because a control found it missing. Deleting the space and
+     * the second backspace from the shell's erase sequence - so the cursor
+     * moves but the character stays on screen - passed every check here, and
+     * chasing that found a real bug underneath: the screen console did not
+     * handle backspace at all, so a correction drew the font's replacement
+     * character instead of stepping back.
+     */
+    if (screen_is_active()) {
+        if (screen_clear() != SCREEN_STATUS_OK) {
+            kernel_test_fail("the shell scenario could not clear the screen");
+        }
+
+        if (shell_feed('a') != SHELL_STATUS_OK ||
+            shell_feed('b') != SHELL_STATUS_OK) {
+            kernel_test_fail("the shell refused a character before an erase");
+        }
+
+        if (screen_verify_cell(1U, 0U, 'b') != SCREEN_STATUS_OK) {
+            kernel_test_fail("a typed character did not reach the screen");
+        }
+
+        if (shell_feed('\b') != SHELL_STATUS_OK) {
+            kernel_test_fail("the shell refused a backspace");
+        }
+
+        /* The erased cell is blank, and the one before it is untouched. */
+        if (screen_verify_cell(1U, 0U, ' ') != SCREEN_STATUS_OK) {
+            kernel_test_fail("backspace did not erase the character on screen");
+        }
+
+        if (screen_verify_cell(0U, 0U, 'a') != SCREEN_STATUS_OK) {
+            kernel_test_fail("backspace erased more than one character");
+        }
+
+        /* And the next character lands where the erased one was. */
+        if (shell_feed('c') != SHELL_STATUS_OK) {
+            kernel_test_fail("the shell refused a character after an erase");
+        }
+
+        if (screen_verify_cell(1U, 0U, 'c') != SCREEN_STATUS_OK) {
+            kernel_test_fail("the cursor did not return to the erased cell");
+        }
+
+        while (shell_get_state().length > 0U) {
+            if (shell_feed('\b') != SHELL_STATUS_OK) {
+                kernel_test_fail("the shell would not clear its line");
+            }
+        }
+    }
+
+    /* And an unknown command is reported without stopping anything. */
+    before = shell_get_state();
+
+    if (shell_execute("definitelynotacommand") != SHELL_STATUS_UNKNOWN_COMMAND) {
+        kernel_test_fail("an unknown command was not reported");
+    }
+
+    if (shell_get_state().unknown != before.unknown + 1U) {
+        kernel_test_fail("an unknown command was not counted");
+    }
+
+    if (shell_execute("help") != SHELL_STATUS_OK) {
+        kernel_test_fail("the shell stopped working after an unknown command");
+    }
+
+    after = shell_get_state();
+    console_write("Seneri OS: shell scenario ran ");
+    console_write_u64(after.commands);
+    console_write(" commands and refused ");
+    console_write_u64(after.unknown);
+    console_write(" unknown\n");
+}
+
 static void keyboard_scenario(void)
 {
     struct keyboard_state before;
@@ -3030,6 +3209,9 @@ void kernel_test_run(
     case KERNEL_TEST_KEYBOARD:
         keyboard_scenario();
         kernel_test_pass();
+    case KERNEL_TEST_SHELL:
+        shell_scenario();
+        kernel_test_pass();
     case KERNEL_TEST_DOUBLE_FAULT:
         kernel_test_double_fault_armed = 1U;
         interrupt_test_set_gate_present(14U, false);
@@ -3163,6 +3345,8 @@ const char *kernel_test_scenario_name(enum kernel_test_scenario scenario)
         return "screen";
     case KERNEL_TEST_KEYBOARD:
         return "keyboard";
+    case KERNEL_TEST_SHELL:
+        return "shell";
     case KERNEL_TEST_INVALID:
         return "invalid";
     default:
