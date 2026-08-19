@@ -22,15 +22,15 @@ the machine can read.
   will eventually swallow exactly the message somebody needed. Uncovered bytes
   become `?`, which the font is checked to cover at initialization so the
   substitution cannot recurse.
-- **Nothing is buffered.** There is no shadow copy of the screen and no dirty
-  tracking. A character goes straight into device memory when it arrives.
+- **The picture is buffered, but its proof is not.** Glyphs are drawn into one
+  heap-backed surface in ordinary write-back memory. Damage is one bounding
+  rectangle and only that rectangle is presented to the framebuffer.
 
-That last one is a trade and it is worth stating plainly. It makes a scroll
-expensive — the whole framebuffer has to be read back through an uncacheable
-mapping — and it buys the property the rest of this document depends on: what is
-on the glass is the only state there is, so `screen_verify_cell` checks the
-console by reading the screen rather than by consulting a copy that could agree
-with the bug.
+Buffering changes where drawing happens, not where correctness is checked.
+`screen_verify_cell` still reads the framebuffer after present and compares the
+glass with the font. Pointing it at the back buffer would be the most dangerous
+possible change here: the writer and verifier could share the same addressing
+bug and agree perfectly while the visible screen was wrong.
 
 ## Where the font comes from
 
@@ -70,17 +70,18 @@ Routing is additive. `console_putc` still writes to the serial port and the VGA
 text buffer exactly as it did, because the test harness reads the serial log and
 a change that quietly moved the transcript would break every scenario at once.
 
-## Reentrancy
+## Staging and reentrancy
 
-The buffer a glyph is copied into is a local in each function that needs one,
-never a file-scope static. Thirty-two bytes on a 16 KiB stack is nothing, and a
-shared buffer would make drawing non-reentrant — this console is live while
-preemption is running, so a thread switched out mid-glyph would hand the next
-caller half of somebody else's character.
+The font's 32-byte row buffer and the at-most 8x32 pixel tile are local to each
+draw, never shared scratch storage. A thread switched out while building a glyph
+therefore cannot hand another caller half of its tile. The screen cursor, damage
+rectangle and surface are shared state and remain unsynchronised; Seneri has one
+CPU and no interrupt handler writes text, so no two callers currently execute
+this path at once. A lock belongs with the first real concurrent writer.
 
 ## Deliberate breakage
 
-Every claim above was broken on purpose and the result recorded. The three that
+Every claim above was broken on purpose and the result recorded. Controls that
 panic do so after a named message and then halt, so the harness catches them on
 its fifteen-second timeout rather than on an exit value; that is how every panic
 in this kernel behaves and it is not specific to this layer.
@@ -93,6 +94,7 @@ in this kernel behaves and it is not specific to this layer.
 | **Reverse the scroll copy so it reads rows it has already overwritten.** | **Passed.** See below. |
 | The same reversal, after the gap it exposed was closed. | `ST FAIL screen: a scroll did not move the rows it copied`. |
 | Feed the font reader a table one byte longer than its header describes. | `font table has bytes after its last glyph`, from `font_self_test`, before any pixel is drawn. |
+| Point `screen_verify_cell` at the back buffer instead of the framebuffer. | **Passed, as it must.** The check then proves only that the buffer agrees with itself; `docs/SURFACE.md` records why this is the control that must never become production code. |
 
 The fourth row is the one worth reading. **The reversed scroll passed every check
 this layer had.** Scrolling by more than the screen height is a fill and
@@ -107,31 +109,30 @@ and it is the only reason that gap is closed rather than shipped.
 ## Proved where
 
 `prove_screen_console` in `src/kernel/boot_proofs.c` runs on every boot: it
-brings the console up, draws a known string, reads it back cell by cell, checks
-that an uncovered byte substitutes, that the last column wraps, and that the
-last row scrolls.
+allocates the full-screen back buffer, draws a known string, presents it, reads
+the framebuffer back cell by cell, checks that an uncovered byte substitutes,
+that the last column wraps, and that the last row scrolls.
 
 The `screen` scenario in `src/kernel/test.c` does what boot cannot. Boot needs
 the console it is printing through, so it can never leave it broken to see what
 happens; nothing after the scenario needs a screen. It draws **all ninety-five
 glyphs and reads every one back**, checks that a second `screen_initialize` is
 refused, that a cell outside the grid is refused by the console rather than by
-the framebuffer's bounds check, and that a scroll moves the rows it copied.
+the framebuffer's bounds check, and that a normal console newline scrolls the
+cached rows and presents the moved picture.
 
     make qemu-test-screen        # exit value 0x28
 
 ## Deferred work
 
-- **A scroll is a full framebuffer read-back.** Under QEMU that is free, because
-  QEMU models no cache; on real hardware every source pixel is an uncached bus
-  cycle and a scroll will be visibly slow. A back buffer in ordinary write-back
-  memory would fix it, and would cost the property that the screen is the only
-  state.
 - **One foreground colour.** There is no attribute per cell, so nothing can be
   highlighted — a panic looks like every other line.
 - **No cursor is drawn.** The cursor position exists in `struct screen_state` and
-  nothing renders it, because nothing yet reads input to put there.
-- **No input at all.** This is half of a terminal. The other half is a keyboard.
+  nothing renders it. The back buffer makes an untorn cursor possible, but
+  cursor shape, blinking and restoration are a later increment.
+- **No synchronization.** The one-CPU kernel has no concurrent screen writer.
+  The first one needs to serialize the cursor and damage state rather than only
+  protecting the pixel copy.
 - **ASCII only**, 0x20 to 0x7E. The format indexes by subtraction from a first
   code point, so a second range would need a second table rather than a wider
   one.

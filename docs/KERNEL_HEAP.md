@@ -145,6 +145,11 @@ construct, refused by name; a freed block reused at the identical address, which
 a heap that only ever grew would fail; the whole window committed and the next
 byte refused; and then the guard.
 
+The screen now owns a long-lived 3 MiB surface by the time scenarios run. The
+`heap` scenario releases that client first so “the whole window” still means all
+16 MiB; the scenario ends at the deliberate guard fault and never returns to a
+caller that needs the screen.
+
 ```text
   vector=14 name=page fault
   cr2=0x0000000401000000

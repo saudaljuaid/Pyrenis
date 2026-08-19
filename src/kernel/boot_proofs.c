@@ -44,6 +44,7 @@
 #include <seneri/screen.h>
 #include <seneri/self_test.h>
 #include <seneri/shell.h>
+#include <seneri/surface.h>
 #include <seneri/test.h>
 #include <seneri/thread.h>
 #include <seneri/timer.h>
@@ -1261,6 +1262,153 @@ void prove_framebuffer(const struct boot_framebuffer *framebuffer)
     }
 
     console_write("Seneri OS: framebuffer established\n");
+}
+
+/*
+ * Prove cached drawing against the real framebuffer, and measure the three
+ * operations whose cost motivates this layer. Raw TSC cycles are reported
+ * rather than converted to time, so TCG, KVM and silicon can be compared
+ * without pretending their clocks are the same clock.
+ */
+void prove_surface(void)
+{
+    const struct framebuffer_state framebuffer = framebuffer_get_state();
+    const uint32_t colour = framebuffer_pack(0x21U, 0x43U, 0x65U);
+    const uint32_t line_colour = framebuffer_pack(0x76U, 0x54U, 0x32U);
+    const uint32_t line_height = 16U;
+    struct surface surface = { 0 };
+    struct surface_rect whole;
+    struct surface_rect line;
+    struct surface_rect source;
+    struct surface_rect exposed;
+    uint64_t start;
+    uint64_t full_cycles;
+    uint64_t line_cycles;
+    uint64_t scroll_cycles;
+    uint32_t pixel = 0U;
+    enum surface_status status;
+
+    if (framebuffer.height < line_height) {
+        console_panic("framebuffer is too short for the surface proof");
+    }
+
+    status = surface_initialize(&surface, framebuffer.width,
+        framebuffer.height);
+
+    if (status != SURFACE_STATUS_OK) {
+        console_panic(surface_status_string(status));
+    }
+
+    whole.x = 0U;
+    whole.y = 0U;
+    whole.width = surface.width;
+    whole.height = surface.height;
+    line.x = 0U;
+    line.y = surface.height / 2U;
+    line.width = surface.width;
+    line.height = line_height;
+    source.x = 0U;
+    source.y = line_height;
+    source.width = surface.width;
+    source.height = surface.height - line_height;
+    exposed.x = 0U;
+    exposed.y = surface.height - line_height;
+    exposed.width = surface.width;
+    exposed.height = line_height;
+
+    start = cpu_read_tsc();
+
+    if (surface_fill_rect(&surface, whole, colour) != SURFACE_STATUS_OK ||
+        surface_present(&surface) != SURFACE_STATUS_OK) {
+        console_panic("surface could not complete a full present");
+    }
+
+    full_cycles = cpu_read_tsc() - start;
+
+    if (surface.last_present_pixels !=
+            (uint64_t)surface.width * surface.height ||
+        surface.damage.pending) {
+        console_panic("full surface damage copied the wrong rectangle");
+    }
+
+    if (framebuffer_read_pixel(surface.width - 1U, surface.height - 1U,
+            &pixel) != FRAMEBUFFER_STATUS_OK ||
+        (pixel & framebuffer_visible_mask()) !=
+            (colour & framebuffer_visible_mask())) {
+        console_panic("a full surface present missed the framebuffer edge");
+    }
+
+    start = cpu_read_tsc();
+
+    if (surface_fill_rect(&surface, line, line_colour) != SURFACE_STATUS_OK ||
+        surface_present(&surface) != SURFACE_STATUS_OK) {
+        console_panic("surface could not complete a one-line update");
+    }
+
+    line_cycles = cpu_read_tsc() - start;
+
+    if (surface.last_present_pixels !=
+        (uint64_t)surface.width * line_height) {
+        console_panic("one-line surface damage copied more than one line");
+    }
+
+    if (framebuffer_read_pixel(line.x, line.y, &pixel) !=
+            FRAMEBUFFER_STATUS_OK ||
+        (pixel & framebuffer_visible_mask()) !=
+            (line_colour & framebuffer_visible_mask())) {
+        console_panic("a one-line surface update did not reach the framebuffer");
+    }
+
+    start = cpu_read_tsc();
+
+    if (surface_copy_rect(&surface, source, 0U, 0U) != SURFACE_STATUS_OK ||
+        surface_fill_rect(&surface, exposed, colour) != SURFACE_STATUS_OK ||
+        surface_present(&surface) != SURFACE_STATUS_OK) {
+        console_panic("surface could not complete a cached scroll");
+    }
+
+    scroll_cycles = cpu_read_tsc() - start;
+
+    if (surface.last_present_pixels !=
+        (uint64_t)surface.width * surface.height) {
+        console_panic("scroll damage did not cover the whole surface");
+    }
+
+    if (surface_verify(&surface) != SURFACE_STATUS_OK) {
+        console_panic("surface does not match its heap allocation");
+    }
+
+    console_write("Seneri OS: surface ");
+    console_write_u64(surface.width);
+    console_putc('x');
+    console_write_u64(surface.height);
+    console_write(" pitch ");
+    console_write_u64(surface.pitch);
+    console_write(" buffer ");
+    console_write_u64((uint64_t)surface.pitch * surface.height);
+    console_write(" bytes\n");
+    console_write("Seneri OS: surface cycles full present ");
+    console_write_u64(full_cycles);
+    console_write(" one-line update ");
+    console_write_u64(line_cycles);
+    console_write(" scroll ");
+    console_write_u64(scroll_cycles);
+    console_putc('\n');
+    console_write("Seneri OS: surface copied ");
+    console_write_u64((uint64_t)surface.width * surface.height);
+    console_write(" full, ");
+    console_write_u64((uint64_t)surface.width * line_height);
+    console_write(" line, ");
+    console_write_u64(surface.last_present_pixels);
+    console_write(" scroll pixels\n");
+
+    status = surface_release(&surface);
+
+    if (status != SURFACE_STATUS_OK) {
+        console_panic(surface_status_string(status));
+    }
+
+    console_write("Seneri OS: cached surface established\n");
 }
 
 /*

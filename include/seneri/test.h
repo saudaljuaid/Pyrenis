@@ -37,6 +37,7 @@ enum kernel_test_scenario {
     KERNEL_TEST_SCREEN,
     KERNEL_TEST_KEYBOARD,
     KERNEL_TEST_SHELL,
+    KERNEL_TEST_SURFACE,
     KERNEL_TEST_INVALID
 };
 

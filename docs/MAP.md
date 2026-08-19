@@ -1,6 +1,6 @@
 # Where everything is
 
-Seneri is thirty-six source files and twenty-three documents. This page exists
+Seneri is forty-three source files and twenty-seven documents. This page exists
 so you never have to find your way through that by opening files at random.
 
 If you are here because the code looked impenetrable: it is not that you are
@@ -11,7 +11,7 @@ ordering constraint that cannot be reordered. What makes it readable is knowing
 
 ## Start here, in this order
 
-1. **`src/kernel/kernel.c`** — 399 lines, and almost all of it is a list. This is
+1. **`src/kernel/kernel.c`** — 456 lines, and almost all of it is a list. This is
    the order boot happens in, top to bottom, and every step is one call. Read it
    first even if none of the calls mean anything yet, because everything else is
    a detail of one of these lines.
@@ -29,9 +29,9 @@ long you will be in there.
 
 | File | | |
 | --- | ---: | --- |
-| `kernel.c` | 399 | The order boot happens in. Nothing else. |
+| `kernel.c` | 456 | The order boot happens in. Nothing else. |
 | `boot_report.c` | 271 | Turns what was discovered into the transcript. Never decides anything. |
-| `boot_proofs.c` | 1648 | Every proof and bring-up boot runs. Panics rather than returning a status. |
+| `boot_proofs.c` | 2243 | Every proof and bring-up boot runs. Panics rather than returning a status. |
 
 ### Getting off the ground
 
@@ -99,7 +99,8 @@ long you will be in there.
 | File | | |
 | --- | ---: | --- |
 | `framebuffer.c` | 460 | The linear framebuffer, validated field by field, mapped uncached. |
-| `screen.c` | 525 | Text on the framebuffer: cells, wrapping, scrolling, and reading it back. |
+| `surface.c` | 795 | Cached pixels, clipped primitives, overlap-safe copies, and damage. |
+| `screen.c` | 604 | Text on the framebuffer: cells, wrapping, scrolling, and reading it back. |
 | `keyboard.c` | 728 | The 8042 and scancode set 1. The first device a person operates. |
 | `shell.c` | 657 | A command line. The first layer here that never panics. |
 | `font.c` | 39 | The C side of the font: names for what the reader can refuse. |
@@ -112,7 +113,7 @@ long you will be in there.
 
 | File | | |
 | --- | ---: | --- |
-| `test.c` | 2817 | The twenty-three QEMU scenarios and what each must print. |
+| `test.c` | 3572 | The twenty-seven QEMU scenarios and what each must print. |
 | `self_test.c` | 588 | Checks that run on synthetic data every boot, before any hardware is touched. |
 
 ## The boot sequence, in order
@@ -122,7 +123,7 @@ it happens.
 
     console_initialize            speak
     interrupts_initialize         stop dying
-    <sixteen self-tests>          prove the arithmetic before trusting the hardware
+    <twenty self-tests>           prove the arithmetic before trusting the hardware
     boot_context_parse            read what the loader left
     acpi_root_discover            find the firmware tables
     acpi_madt / fadt / mcfg       read them
@@ -148,6 +149,7 @@ it happens.
     prove_threads                 more than one thread of control
     prove_preemption              threads that never yield still lose the CPU
     prove_framebuffer             every one of 786,432 pixels
+    prove_surface                 cached drawing and damage copied to the glass
     draw_logo                     the splash
     prove_screen_console          text on the screen, read back off the glass
     prove_keyboard                a scancode injected through 0xD2, decoded back

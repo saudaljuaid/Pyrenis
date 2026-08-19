@@ -25,6 +25,7 @@ enum screen_status {
     SCREEN_STATUS_BAD_FONT,
     SCREEN_STATUS_CELL_TOO_LARGE,
     SCREEN_STATUS_NO_ROOM,
+    SCREEN_STATUS_SURFACE_FAILURE,
     SCREEN_STATUS_DRAW_FAILURE
 };
 
@@ -47,6 +48,9 @@ struct screen_state {
  * drawing half a character.
  */
 enum screen_status screen_initialize(void);
+
+/* Give the owned surface back to the heap and stop mirroring console output. */
+enum screen_status screen_release(void);
 
 bool screen_is_active(void);
 

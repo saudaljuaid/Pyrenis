@@ -97,7 +97,7 @@ Then run:
 ```sh
 make verify   # clean build plus ELF, Multiboot2, symbol, and W^X checks
 make smoke      # run the strict normal-boot QEMU protocol
-make qemu-tests # run twenty-three deterministic fault, device and thread scenarios
+make qemu-tests # run twenty-seven deterministic fault, device and thread scenarios
 make run      # optional interactive boot
 make hooks    # enforce verification in this local clone
 ```
@@ -129,6 +129,7 @@ make hooks    # enforce verification in this local clone
 - `src/kernel/thread.c` — kernel threads, guarded stacks, and the run queue.
 - `src/arch/x86_64/thread.S` — the context switch and where a new thread starts.
 - `src/kernel/framebuffer.c` — every pixel on the screen, and proof of each one.
+- `src/kernel/surface.c` — cached pixels, clipped drawing, and damage present.
 - `src/rust/logo.rs` — the boot logo decoder, in Rust, and its refusals.
 - `tools/make-logo-asset.py` — turns the logo into what the kernel can decode.
 - `linker.ld` — low-memory ELF layout with separate, page-aligned R, RX, and RW
@@ -151,6 +152,7 @@ make hooks    # enforce verification in this local clone
   and running programs.
 - `docs/THREADS.md` — more than one thread of control, and the page below each.
 - `docs/FRAMEBUFFER.md` — pixels, and why a picture is not proof of one.
+- `docs/SURFACE.md` — the cached back buffer, drawing primitives, and damage.
 - `docs/RUST.md` — the one component that is not C, and where that line goes.
 - `docs/SCREEN_CONSOLE.md` — text on the framebuffer, and the font it draws
   from.
@@ -260,13 +262,15 @@ costs the route from that list to storage, wireless, and running programs, and
 records why Linux driver source is not on it. The logo is on that screen at boot, decoded from a run-length image by the one
 Rust component in the kernel and blitted by C, with all 65,536 of its pixels
 read back off the framebuffer and compared against the decode before boot
-continues. There is still no text: nothing yet knows what a character is, and the
-framebuffer is uncacheable rather than write-combining, so every store to it is
-a bus cycle. A thread that overflows its stack is contained by
+continues. Text is drawn into a 3 MiB heap-backed surface in ordinary
+write-back memory; glyph-sized damage and one-line updates present only their
+bounding rectangle, while a scroll copies cached rows before its one full
+present. Verification still reads the framebuffer, so the back buffer cannot
+certify its own addressing. A thread that overflows its stack is contained by
 its guard page and the double-fault stack, but cannot yet be diagnosed as an
 overflow, because the page fault has no interrupt stack of its own. It has a
-deliberately narrow single-core foundation, with no preemption, userspace,
-filesystem, networking, graphics, or hardware drivers. Those arrive only after the previous layer has an executable
-acceptance test.
+deliberately narrow single-core foundation, with no userspace, filesystems,
+networking, windows, or storage drivers. Those arrive only after the previous
+layer has an executable acceptance test.
 
 Seneri OS is licensed under GPL-3.0; see `LICENSE`.

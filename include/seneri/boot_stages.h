@@ -90,6 +90,7 @@ void prove_threads(void);
 void prove_preemption(void);
 
 void prove_framebuffer(const struct boot_framebuffer *framebuffer);
+void prove_surface(void);
 void draw_logo(void);
 
 /*

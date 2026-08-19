@@ -39,6 +39,7 @@ enum font_status {
  * anything taller, so the two bounds are one bound stated twice; the static
  * assertion in src/kernel/screen.c is what keeps them equal.
  */
+#define FONT_MAX_CELL_WIDTH 8U
 #define FONT_MAX_CELL_HEIGHT 32U
 
 /* Returns 1 when the reader's own rejection tests all pass. */

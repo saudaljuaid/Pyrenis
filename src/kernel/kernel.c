@@ -40,6 +40,7 @@
 #include <seneri/screen.h>
 #include <seneri/self_test.h>
 #include <seneri/shell.h>
+#include <seneri/surface.h>
 #include <seneri/test.h>
 #include <seneri/thread.h>
 #include <seneri/timer.h>
@@ -162,6 +163,10 @@ _Noreturn void kernel_main(uint32_t magic, uintptr_t boot_information)
 
     if (!framebuffer_self_test()) {
         console_panic("framebuffer geometry self-test failed");
+    }
+
+    if (!surface_self_test()) {
+        console_panic("surface primitive self-test failed");
     }
 
     if (!screen_self_test()) {
@@ -315,6 +320,7 @@ _Noreturn void kernel_main(uint32_t magic, uintptr_t boot_information)
     prove_framebuffer(&context.framebuffer);
 
     if (framebuffer_is_active()) {
+        prove_surface();
         draw_logo();
         prove_screen_console();
     }

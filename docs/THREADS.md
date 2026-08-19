@@ -122,6 +122,11 @@ self and joining nothing, stopping while a thread is runnable, each worker
 confirming `thread_current` answers about the thread actually running, and every
 stack and guard being absent after teardown.
 
+The heap does not return committed pages. With the screen surface already live,
+the first thread table can make it commit one more page, so the scenario performs
+one empty start and stop before recording its physical-frame baseline. The
+measured start and stop must then return every stack frame to that exact baseline.
+
 The `thread-guard` scenario walks off a stack and requires the fault, at the
 guard address, on the created thread's own stack — which also proves the fault
 path works on a stack this layer allocated rather than only on `boot.S`'s.

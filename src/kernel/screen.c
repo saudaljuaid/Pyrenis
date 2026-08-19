@@ -6,6 +6,7 @@
 #include <seneri/font.h>
 #include <seneri/framebuffer.h>
 #include <seneri/screen.h>
+#include <seneri/surface.h>
 
 /*
  * Text on the framebuffer.
@@ -16,13 +17,11 @@
  *
  * Two decisions are worth stating because neither is forced.
  *
- * The first is that nothing is buffered. There is no shadow copy of the screen
- * and no dirty-region tracking; a character is drawn straight into device
- * memory when it arrives. That costs a scroll dearly - it has to read the
- * whole framebuffer back through an uncacheable mapping - and it buys the
- * property that what is on the glass is the only state there is, so
- * screen_verify_cell can check the console by reading the screen rather than
- * by consulting a copy that could agree with the bug.
+ * The first is that drawing goes through a cached surface. Reading the
+ * framebuffer to scroll means one uncacheable device read per pixel; moving
+ * the same pixels in ordinary RAM avoids that cost. Verification still reads
+ * the framebuffer after present, because asking the surface whether it agrees
+ * with itself would turn the strongest proof in this stack into no proof.
  *
  * The second is that an unknown byte is drawn rather than refused. A console
  * exists to carry the message that explains what went wrong; one that stops on
@@ -48,13 +47,13 @@
 static struct screen_state state;
 static uint32_t background_pixel;
 static uint32_t foreground_pixel;
+static struct surface back_buffer;
 
 /*
- * The row buffer a glyph is copied into is a local in each function that needs
- * one, never a file-scope static. Thirty-two bytes on a 16 KiB stack is
- * nothing, and a shared buffer would make drawing non-reentrant: this console
- * is live while preemption is running, so a thread switched out mid-glyph
- * would hand the next caller half of somebody else's character.
+ * The row buffer and pixel tile a glyph is copied into are local, never
+ * file-scope scratch. Their combined maximum is 1,056 bytes on a 16 KiB stack,
+ * and keeping them local means a thread switched out mid-glyph cannot hand the
+ * next caller half of somebody else's character.
  *
  * The size is the header's bound rather than the font that happens to be built
  * in, so a taller font cannot silently overrun it. src/rust/font.rs refuses
@@ -63,6 +62,10 @@ static uint32_t foreground_pixel;
 _Static_assert(
     FONT_MAX_CELL_HEIGHT == 32U,
     "the row buffer bound no longer matches MAX_HEIGHT in src/rust/font.rs"
+);
+_Static_assert(
+    FONT_MAX_CELL_WIDTH == 8U,
+    "the cell width bound no longer matches MAX_WIDTH in src/rust/font.rs"
 );
 
 static uint32_t font_first;
@@ -81,6 +84,7 @@ static bool font_covers(uint32_t code)
 static enum screen_status draw_cell(uint32_t column, uint32_t row, char character)
 {
     uint8_t glyph_rows[FONT_MAX_CELL_HEIGHT];
+    uint32_t pixels[FONT_MAX_CELL_WIDTH * FONT_MAX_CELL_HEIGHT];
     uint32_t code = (uint32_t)(unsigned char)character;
 
     if (!font_covers(code)) {
@@ -95,18 +99,21 @@ static enum screen_status draw_cell(uint32_t column, uint32_t row, char characte
     const uint32_t origin_x = column * state.cell_width;
     const uint32_t origin_y = row * state.cell_height;
 
-    for (uint32_t y = 0; y < state.cell_height; ++y) {
+    for (uint32_t y = 0U; y < state.cell_height; ++y) {
         const uint8_t bits = glyph_rows[y];
 
-        for (uint32_t x = 0; x < state.cell_width; ++x) {
+        for (uint32_t x = 0U; x < state.cell_width; ++x) {
             const bool lit = (bits & (uint8_t)(0x80U >> x)) != 0U;
-            const uint32_t pixel = lit ? foreground_pixel : background_pixel;
-
-            if (framebuffer_write_pixel(origin_x + x, origin_y + y, pixel) !=
-                FRAMEBUFFER_STATUS_OK) {
-                return SCREEN_STATUS_DRAW_FAILURE;
-            }
+            pixels[y * state.cell_width + x] =
+                lit ? foreground_pixel : background_pixel;
         }
+    }
+
+    if (surface_blit(&back_buffer, origin_x, origin_y, pixels,
+            state.cell_width, state.cell_height,
+            state.cell_width * SURFACE_BYTES_PER_PIXEL) != SURFACE_STATUS_OK ||
+        surface_present(&back_buffer) != SURFACE_STATUS_OK) {
+        return SCREEN_STATUS_DRAW_FAILURE;
     }
 
     return SCREEN_STATUS_OK;
@@ -119,8 +126,23 @@ static enum screen_status draw_cell(uint32_t column, uint32_t row, char characte
  */
 static enum screen_status scroll_one_line(void)
 {
-    if (framebuffer_scroll_up(state.cell_height, background_pixel) !=
-        FRAMEBUFFER_STATUS_OK) {
+    struct surface_rect source;
+    struct surface_rect exposed;
+
+    source.x = 0U;
+    source.y = state.cell_height;
+    source.width = back_buffer.width;
+    source.height = back_buffer.height - state.cell_height;
+    exposed.x = 0U;
+    exposed.y = back_buffer.height - state.cell_height;
+    exposed.width = back_buffer.width;
+    exposed.height = state.cell_height;
+
+    if (surface_copy_rect(&back_buffer, source, 0U, 0U) !=
+            SURFACE_STATUS_OK ||
+        surface_fill_rect(&back_buffer, exposed, background_pixel) !=
+            SURFACE_STATUS_OK ||
+        surface_present(&back_buffer) != SURFACE_STATUS_OK) {
         return SCREEN_STATUS_DRAW_FAILURE;
     }
 
@@ -231,6 +253,11 @@ enum screen_status screen_initialize(void)
     foreground_pixel = framebuffer_pack(SCREEN_FOREGROUND_RED,
         SCREEN_FOREGROUND_GREEN, SCREEN_FOREGROUND_BLUE);
 
+    if (surface_initialize(&back_buffer, framebuffer.width,
+            framebuffer.height) != SURFACE_STATUS_OK) {
+        return SCREEN_STATUS_SURFACE_FAILURE;
+    }
+
     state.columns = columns;
     state.rows = rows;
     state.cell_width = width;
@@ -244,6 +271,29 @@ enum screen_status screen_initialize(void)
     return screen_clear();
 }
 
+enum screen_status screen_release(void)
+{
+    if (!state.active) {
+        return SCREEN_STATUS_NOT_INITIALIZED;
+    }
+
+    if (surface_release(&back_buffer) != SURFACE_STATUS_OK) {
+        return SCREEN_STATUS_SURFACE_FAILURE;
+    }
+
+    /*
+     * A released console must stop receiving mirrored output immediately. A
+     * partially live cursor would let a later write reach a surface whose heap
+     * storage has already been returned.
+     */
+    state = (struct screen_state){ 0 };
+    background_pixel = 0U;
+    foreground_pixel = 0U;
+    font_first = 0U;
+    font_count = 0U;
+    return SCREEN_STATUS_OK;
+}
+
 bool screen_is_active(void)
 {
     return state.active;
@@ -255,7 +305,13 @@ enum screen_status screen_clear(void)
         return SCREEN_STATUS_NOT_INITIALIZED;
     }
 
-    if (framebuffer_fill(background_pixel) != FRAMEBUFFER_STATUS_OK) {
+    const struct surface_rect whole = {
+        0U, 0U, back_buffer.width, back_buffer.height
+    };
+
+    if (surface_fill_rect(&back_buffer, whole, background_pixel) !=
+            SURFACE_STATUS_OK ||
+        surface_present(&back_buffer) != SURFACE_STATUS_OK) {
         return SCREEN_STATUS_DRAW_FAILURE;
     }
 
@@ -408,6 +464,7 @@ const char *screen_status_string(enum screen_status status)
         "font table is unusable for a console",
         "font cell is taller than the row buffer",
         "framebuffer has no room for a character grid",
+        "screen console could not create its back buffer",
         "screen console failed to draw"
     };
 
@@ -498,6 +555,7 @@ static bool refusals_are_named(void)
         SCREEN_STATUS_BAD_FONT,
         SCREEN_STATUS_CELL_TOO_LARGE,
         SCREEN_STATUS_NO_ROOM,
+        SCREEN_STATUS_SURFACE_FAILURE,
         SCREEN_STATUS_DRAW_FAILURE
     };
 

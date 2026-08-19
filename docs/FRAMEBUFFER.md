@@ -129,20 +129,14 @@ writing it.
 
 ## Deferred work
 
-- **There is no text.** Nothing here knows what a character is. A font, a
-  console and a cursor are the next increment, and a font can arrive as a
-  Multiboot2 module — the parser already walks module tags.
-- **No double buffering.** Every write goes straight to the screen, so anything
-  animated will tear. That needs a back buffer in the heap and a blit, which
-  needs the blit to be fast, which needs the next item.
 - **The window is uncacheable, not write-combining.** Uncacheable is correct and
   slow: every store is a bus cycle. Write-combining would batch them, and needs
   a page attribute table entry set up for it — a change to `paging.c`'s memory
   types, which deserves its own increment and its own proof.
-- **The VGA text console still writes to 0xB8000.** Harmless once the loader has
-  set a graphics mode, because nothing displays it, but it is now dead output.
-  Making `console.c` choose between the two belongs with the increment that can
-  actually draw a character.
+- **The VGA text console still mirrors output to 0xB8000.** It is invisible once
+  the loader sets a graphics mode, but remains the fallback when no framebuffer
+  is present. Choosing one physical output path dynamically needs a policy for
+  machines that expose both.
 - **Nothing resizes or re-modes.** The mode is whatever the loader set, for the
   life of the boot. Changing it means talking to the display hardware, which
   means a driver, which means PCI enumeration turning into device ownership.

@@ -8,7 +8,8 @@ SERIAL_LOG := $(BUILD_DIR)/serial.log
 TEST_BUILD_DIR := $(BUILD_DIR)/tests
 TEST_SCENARIOS := normal breakpoint invalid-opcode page-fault ist pit unexpected \
 	double-fault apic ioapic retired apic-timer tsc pm-timer pit-retired timers \
-	paging heap pci pci-ecam threads thread-guard framebuffer screen keyboard shell
+	paging heap pci pci-ecam threads thread-guard framebuffer screen keyboard shell \
+	surface
 TEST_TARGETS := $(addprefix qemu-test-,$(TEST_SCENARIOS))
 
 CC := gcc
@@ -192,6 +193,7 @@ qemu-test-%: $(TEST_BUILD_DIR)/%/seneri.iso
 		screen) expected=81 ;; \
 		keyboard) expected=83 ;; \
 		shell) expected=85 ;; \
+		surface) expected=87 ;; \
 		*) echo 'unknown QEMU scenario: $*'; exit 1 ;; \
 	esac; \
 	# Only pci-ecam departs from the default machine. i440fx publishes no \
@@ -272,6 +274,10 @@ qemu-test-%: $(TEST_BUILD_DIR)/%/seneri.iso
 		  ! grep -Eq '^Seneri OS: framebuffer [0-9]+x[0-9]+ at 0x[0-9A-F]+ pitch [0-9]+ RGB [0-9]+/[0-9]+/[0-9]+$$' "$$log" || \
 		  ! grep -Fxq 'Seneri OS: framebuffer verified 786432 pixels' "$$log" || \
 		  ! grep -Fq 'Seneri OS: framebuffer established' "$$log" || \
+		  ! grep -Eq '^Seneri OS: surface [0-9]+x[0-9]+ pitch [0-9]+ buffer [0-9]+ bytes$$' "$$log" || \
+		  ! grep -Eq '^Seneri OS: surface cycles full present [0-9]+ one-line update [0-9]+ scroll [0-9]+$$' "$$log" || \
+		  ! grep -Eq '^Seneri OS: surface copied [0-9]+ full, [0-9]+ line, [0-9]+ scroll pixels$$' "$$log" || \
+		  ! grep -Fq 'Seneri OS: cached surface established' "$$log" || \
 		  ! grep -Eq '^Seneri OS: screen console [0-9]+x[0-9]+ cells of 8x16, font [0-9]+ bytes$$' "$$log" || \
 		  ! grep -Eq '^Seneri OS: screen console drew [0-9]+ characters and scrolled [0-9]+ times$$' "$$log" || \
 		  ! grep -Fq 'Seneri OS: screen console established' "$$log" || \
@@ -326,6 +332,9 @@ qemu-test-%: $(TEST_BUILD_DIR)/%/seneri.iso
 				diagnostics_ok=false ;; \
 		framebuffer) \
 			grep -Eq '^ST FRAMEBUFFER [0-9]+x[0-9]+ probes 16 pitch [0-9]+$$' "$$log" || \
+				diagnostics_ok=false ;; \
+		surface) \
+			grep -Eq '^ST SURFACE full [0-9]+ line [0-9]+ clipped 4 overlap both damage 20$$' "$$log" || \
 				diagnostics_ok=false ;; \
 		thread-guard) \
 			grep -Fq 'ST THREAD guard 0x0000000800005000' "$$log" && \

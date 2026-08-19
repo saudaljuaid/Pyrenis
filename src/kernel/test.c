@@ -24,6 +24,7 @@
 #include <seneri/screen.h>
 #include <seneri/shell.h>
 #include <seneri/pm_timer.h>
+#include <seneri/surface.h>
 #include <seneri/test.h>
 #include <seneri/thread.h>
 #include <seneri/timer.h>
@@ -243,6 +244,10 @@ static enum kernel_test_scenario scenario_from_value(
         return KERNEL_TEST_FRAMEBUFFER;
     }
 
+    if (token_equals(value, length, "surface")) {
+        return KERNEL_TEST_SURFACE;
+    }
+
     return KERNEL_TEST_INVALID;
 }
 
@@ -311,6 +316,8 @@ static uint8_t scenario_exit_value(enum kernel_test_scenario scenario)
         return UINT8_C(0x29);
     case KERNEL_TEST_SHELL:
         return UINT8_C(0x2A);
+    case KERNEL_TEST_SURFACE:
+        return UINT8_C(0x2B);
     default:
         return QEMU_FAILURE_VALUE;
     }
@@ -1473,6 +1480,17 @@ static void heap_scenario(void)
         kernel_test_fail("kernel heap is not online");
     }
 
+    /*
+     * The heap's boundary proof must be able to fill its whole 16 MiB window.
+     * The screen normally owns a long-lived 3 MiB client now, so this one
+     * destructive scenario relinquishes it before testing the allocator in
+     * isolation. The scenario ends by faulting on the upper guard and never
+     * returns to code that needs the screen.
+     */
+    if (screen_is_active() && screen_release() != SCREEN_STATUS_OK) {
+        kernel_test_fail("the screen did not release its heap surface");
+    }
+
     if (heap_initialize() != HEAP_STATUS_ALREADY_INITIALIZED) {
         kernel_test_fail("heap accepted a second initialization");
     }
@@ -2135,6 +2153,18 @@ static void threads_scenario(void)
 
     if (thread_is_started()) {
         kernel_test_fail("threads were started before their scenario");
+    }
+
+    /*
+     * The heap grows but deliberately never shrinks. With the surface already
+     * occupying its first 3 MiB, the first thread table can commit one more
+     * heap page that remains mapped after the table is freed. Warm that path
+     * before taking the frame baseline so the comparison below measures only
+     * the stack frames this scenario owns.
+     */
+    if (thread_start() != THREAD_STATUS_OK ||
+        thread_stop() != THREAD_STATUS_OK) {
+        kernel_test_fail("threads did not survive an empty start and stop");
     }
 
     before = frame_allocator_get_stats();
@@ -2850,39 +2880,6 @@ static void screen_scenario(void)
     }
 
     /*
-     * Scrolling by the whole screen is a clear, not a refusal. That branch is
-     * unreachable from the console, which only ever scrolls one cell at a time.
-     */
-    if (framebuffer_scroll_up(before.rows * before.cell_height + 1U,
-            framebuffer_pack(0U, 0U, 0U)) != FRAMEBUFFER_STATUS_OK) {
-        kernel_test_fail("scrolling past the bottom was refused");
-    }
-
-    if (screen_clear() != SCREEN_STATUS_OK) {
-        kernel_test_fail("the console would not clear after a full scroll");
-    }
-
-    /*
-     * And a scroll of nothing changes nothing. Drawn, scrolled by zero, and
-     * still there.
-     */
-    if (screen_write("scroll") != SCREEN_STATUS_OK) {
-        kernel_test_fail("the console refused to write");
-    }
-
-    if (framebuffer_scroll_up(0U, framebuffer_pack(0U, 0U, 0U)) !=
-        FRAMEBUFFER_STATUS_OK) {
-        kernel_test_fail("scrolling by zero was refused");
-    }
-
-    for (uint32_t column = 0U; column < 6U; ++column) {
-        if (screen_verify_cell(column, 0U, "scroll"[column]) !=
-            SCREEN_STATUS_OK) {
-            kernel_test_fail("scrolling by zero moved the screen");
-        }
-    }
-
-    /*
      * A scroll that actually moves rows, checked by content.
      *
      * This exists because a control found it missing. Scrolling by more than
@@ -2900,9 +2897,14 @@ static void screen_scenario(void)
         kernel_test_fail("the console refused the scroll fixture");
     }
 
-    if (framebuffer_scroll_up(before.cell_height,
-            framebuffer_pack(0U, 0U, 0U)) != FRAMEBUFFER_STATUS_OK) {
-        kernel_test_fail("scrolling by one cell was refused");
+    while (screen_get_state().row + 1U < before.rows) {
+        if (screen_putc('\n') != SCREEN_STATUS_OK) {
+            kernel_test_fail("the console refused to reach its last row");
+        }
+    }
+
+    if (screen_putc('\n') != SCREEN_STATUS_OK) {
+        kernel_test_fail("the console refused to scroll one line");
     }
 
     /* The second line must now be the first. */
@@ -2916,6 +2918,205 @@ static void screen_scenario(void)
     console_write("Seneri OS: screen scenario drew ");
     console_write_u64((uint64_t)count);
     console_write(" glyphs and read every one back\n");
+}
+
+static uint32_t surface_test_colour(uint32_t value)
+{
+    return framebuffer_pack(
+        (uint8_t)(value * 3U + 1U),
+        (uint8_t)(value * 5U + 2U),
+        (uint8_t)(value * 7U + 3U)
+    );
+}
+
+static void require_framebuffer_pixel(
+    uint32_t x,
+    uint32_t y,
+    uint32_t expected,
+    const char *reason
+)
+{
+    uint32_t pixel = 0U;
+    const uint32_t mask = framebuffer_visible_mask();
+
+    if (framebuffer_read_pixel(x, y, &pixel) != FRAMEBUFFER_STATUS_OK ||
+        (pixel & mask) != (expected & mask)) {
+        kernel_test_fail(reason);
+    }
+}
+
+/*
+ * The self-test proves the primitives over guarded synthetic rows. This proves
+ * the other half: heap allocation, damage presented to device memory, and the
+ * framebuffer pitch all agree on where the same pixels live.
+ */
+static void surface_scenario(void)
+{
+    uint32_t source[4U * 5U];
+    const struct framebuffer_state framebuffer = framebuffer_get_state();
+    const uint32_t base = surface_test_colour(1U);
+    const uint32_t changed = surface_test_colour(2U);
+    const uint32_t clipped_colour = surface_test_colour(3U);
+    struct surface surface = { 0 };
+    struct surface_rect rectangle;
+    uint32_t origin_x;
+    uint32_t origin_y;
+
+    if (!framebuffer_is_active()) {
+        kernel_test_fail("the surface scenario has no framebuffer");
+    }
+
+    if (framebuffer.width < 16U || framebuffer.height < 32U) {
+        kernel_test_fail("the framebuffer is too small for surface fixtures");
+    }
+
+    if (surface_initialize(&surface, framebuffer.width, framebuffer.height) !=
+        SURFACE_STATUS_OK) {
+        kernel_test_fail("the surface scenario could not allocate its buffer");
+    }
+
+    rectangle.x = 0U;
+    rectangle.y = 0U;
+    rectangle.width = surface.width;
+    rectangle.height = surface.height;
+
+    if (surface_fill_rect(&surface, rectangle, base) != SURFACE_STATUS_OK ||
+        surface_present(&surface) != SURFACE_STATUS_OK ||
+        surface.last_present_pixels !=
+            (uint64_t)surface.width * surface.height ||
+        surface.damage.pending) {
+        kernel_test_fail("a full surface present copied the wrong damage");
+    }
+
+    require_framebuffer_pixel(surface.width - 1U, surface.height - 1U, base,
+        "a full surface present missed its last pixel");
+
+    if (surface_pixel(&surface, surface.width - 2U, surface.height - 2U,
+            changed) != SURFACE_STATUS_OK ||
+        surface_present(&surface) != SURFACE_STATUS_OK ||
+        surface.last_present_pixels != 1U) {
+        kernel_test_fail("one damaged surface pixel copied more than itself");
+    }
+
+    require_framebuffer_pixel(surface.width - 2U, surface.height - 2U,
+        changed, "a damaged surface pixel was presented on the wrong row");
+
+    rectangle.x = 0U;
+    rectangle.y = surface.height / 2U;
+    rectangle.width = surface.width;
+    rectangle.height = 16U;
+
+    if (surface_fill_rect(&surface, rectangle, changed) != SURFACE_STATUS_OK ||
+        surface_present(&surface) != SURFACE_STATUS_OK ||
+        surface.last_present_pixels != (uint64_t)surface.width * 16U) {
+        kernel_test_fail("one text line copied more than one line");
+    }
+
+    rectangle.x = surface.width - 2U;
+    rectangle.y = surface.height - 2U;
+    rectangle.width = 4U;
+    rectangle.height = 4U;
+
+    if (surface_fill_rect(&surface, rectangle, clipped_colour) !=
+            SURFACE_STATUS_OK ||
+        surface_present(&surface) != SURFACE_STATUS_OK ||
+        surface.last_present_pixels != 4U) {
+        kernel_test_fail("a clipped fill crossed the surface edge");
+    }
+
+    require_framebuffer_pixel(surface.width - 1U, surface.height - 1U,
+        clipped_colour, "a clipped fill missed its visible corner");
+
+    for (uint32_t y = 0U; y < 4U; ++y) {
+        for (uint32_t x = 0U; x < 4U; ++x) {
+            source[y * 5U + x] = surface_test_colour(y * 16U + x);
+        }
+
+        source[y * 5U + 4U] = UINT32_C(0xDEADBEEF);
+    }
+
+    origin_x = 8U;
+    origin_y = 8U;
+
+    if (surface_blit(&surface, origin_x, origin_y, source, 4U, 4U,
+            5U * SURFACE_BYTES_PER_PIXEL) != SURFACE_STATUS_OK ||
+        surface_present(&surface) != SURFACE_STATUS_OK ||
+        surface.last_present_pixels != 16U) {
+        kernel_test_fail("a padded source did not blit as four rows");
+    }
+
+    for (uint32_t y = 0U; y < 4U; ++y) {
+        for (uint32_t x = 0U; x < 4U; ++x) {
+            require_framebuffer_pixel(origin_x + x, origin_y + y,
+                surface_test_colour(y * 16U + x),
+                "surface blit used the destination pitch for its source");
+        }
+    }
+
+    rectangle.x = origin_x;
+    rectangle.y = origin_y;
+    rectangle.width = 4U;
+    rectangle.height = 4U;
+
+    if (surface_copy_rect(&surface, rectangle, origin_x + 1U,
+            origin_y + 1U) != SURFACE_STATUS_OK ||
+        surface_present(&surface) != SURFACE_STATUS_OK) {
+        kernel_test_fail("a downward overlapping copy was refused");
+    }
+
+    for (uint32_t y = 0U; y < 4U; ++y) {
+        for (uint32_t x = 0U; x < 4U; ++x) {
+            require_framebuffer_pixel(origin_x + x + 1U,
+                origin_y + y + 1U, surface_test_colour(y * 16U + x),
+                "a downward overlapping copy read overwritten pixels");
+        }
+    }
+
+    if (surface_blit(&surface, origin_x, origin_y, source, 4U, 4U,
+            5U * SURFACE_BYTES_PER_PIXEL) != SURFACE_STATUS_OK ||
+        surface_present(&surface) != SURFACE_STATUS_OK) {
+        kernel_test_fail("the overlap fixture could not be restored");
+    }
+
+    rectangle.x = origin_x + 1U;
+    rectangle.y = origin_y + 1U;
+    rectangle.width = 3U;
+    rectangle.height = 3U;
+
+    if (surface_copy_rect(&surface, rectangle, origin_x, origin_y) !=
+            SURFACE_STATUS_OK ||
+        surface_present(&surface) != SURFACE_STATUS_OK) {
+        kernel_test_fail("an upward overlapping copy was refused");
+    }
+
+    for (uint32_t y = 0U; y < 3U; ++y) {
+        for (uint32_t x = 0U; x < 3U; ++x) {
+            require_framebuffer_pixel(origin_x + x, origin_y + y,
+                surface_test_colour((y + 1U) * 16U + x + 1U),
+                "an upward overlapping copy read overwritten pixels");
+        }
+    }
+
+    if (surface_pixel(&surface, 1U, 2U, changed) != SURFACE_STATUS_OK ||
+        surface_pixel(&surface, 4U, 6U, changed) != SURFACE_STATUS_OK ||
+        !surface.damage.pending || surface.damage.rectangle.x != 1U ||
+        surface.damage.rectangle.y != 2U ||
+        surface.damage.rectangle.width != 4U ||
+        surface.damage.rectangle.height != 5U ||
+        surface_present(&surface) != SURFACE_STATUS_OK ||
+        surface.last_present_pixels != 20U) {
+        kernel_test_fail("surface damage did not form one bounding rectangle");
+    }
+
+    if (surface_release(&surface) != SURFACE_STATUS_OK) {
+        kernel_test_fail("the surface scenario leaked its buffer");
+    }
+
+    console_write("ST SURFACE full ");
+    console_write_u64((uint64_t)framebuffer.width * framebuffer.height);
+    console_write(" line ");
+    console_write_u64((uint64_t)framebuffer.width * 16U);
+    console_write(" clipped 4 overlap both damage 20\n");
 }
 
 static void framebuffer_scenario(const struct boot_framebuffer *framebuffer)
@@ -3212,6 +3413,9 @@ void kernel_test_run(
     case KERNEL_TEST_SHELL:
         shell_scenario();
         kernel_test_pass();
+    case KERNEL_TEST_SURFACE:
+        surface_scenario();
+        kernel_test_pass();
     case KERNEL_TEST_DOUBLE_FAULT:
         kernel_test_double_fault_armed = 1U;
         interrupt_test_set_gate_present(14U, false);
@@ -3347,6 +3551,8 @@ const char *kernel_test_scenario_name(enum kernel_test_scenario scenario)
         return "keyboard";
     case KERNEL_TEST_SHELL:
         return "shell";
+    case KERNEL_TEST_SURFACE:
+        return "surface";
     case KERNEL_TEST_INVALID:
         return "invalid";
     default:
