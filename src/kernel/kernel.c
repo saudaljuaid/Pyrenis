@@ -30,6 +30,7 @@
 #include <seneri/font.h>
 #include <seneri/logo.h>
 #include <seneri/ioapic.h>
+#include <seneri/keyboard.h>
 #include <seneri/memory.h>
 #include <seneri/paging.h>
 #include <seneri/pci.h>
@@ -164,6 +165,10 @@ _Noreturn void kernel_main(uint32_t magic, uintptr_t boot_information)
 
     if (!screen_self_test()) {
         console_panic("screen console grid self-test failed");
+    }
+
+    if (!keyboard_self_test()) {
+        console_panic("keyboard translation self-test failed");
     }
 
     /*
@@ -309,6 +314,13 @@ _Noreturn void kernel_main(uint32_t magic, uintptr_t boot_information)
         prove_screen_console();
     }
 
+    /*
+     * Input beside output, and before the scenarios, so a scenario that wants
+     * a keyboard finds one. It needs only the I/O APIC, which came up long
+     * before this, so there is nothing else holding it back.
+     */
+    prove_keyboard();
+
     console_write("Seneri OS: day one passed\n");
     console_write("Seneri OS: memory foundation passed\n");
     test_scenario = kernel_test_select(&context);
@@ -414,6 +426,7 @@ _Noreturn void kernel_main(uint32_t magic, uintptr_t boot_information)
     console_write("Seneri OS: framebuffer passed\n");
     console_write("Seneri OS: logo passed\n");
     console_write("Seneri OS: screen console passed\n");
+    console_write("Seneri OS: keyboard passed\n");
     console_write("Seneri OS: never triple fault milestone passed\n");
 
     if (test_scenario == KERNEL_TEST_NORMAL) {

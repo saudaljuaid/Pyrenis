@@ -99,4 +99,12 @@ void draw_logo(void);
  */
 void prove_screen_console(void);
 
+/*
+ * The first device here that a person operates. Boot cannot wait for a
+ * keystroke, so it injects one through the controller's own 0xD2 command and
+ * proves the whole path - routing, vector, handler, decode, queue - with only
+ * the finger simulated.
+ */
+void prove_keyboard(void);
+
 #endif

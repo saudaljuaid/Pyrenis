@@ -20,6 +20,7 @@
 #include <seneri/pci.h>
 #include <seneri/pic.h>
 #include <seneri/pit.h>
+#include <seneri/keyboard.h>
 #include <seneri/screen.h>
 #include <seneri/pm_timer.h>
 #include <seneri/test.h>
@@ -225,6 +226,10 @@ static enum kernel_test_scenario scenario_from_value(
         return KERNEL_TEST_THREAD_GUARD;
     }
 
+    if (token_equals(value, length, "keyboard")) {
+        return KERNEL_TEST_KEYBOARD;
+    }
+
     if (token_equals(value, length, "screen")) {
         return KERNEL_TEST_SCREEN;
     }
@@ -297,6 +302,8 @@ static uint8_t scenario_exit_value(enum kernel_test_scenario scenario)
         return UINT8_C(0x27);
     case KERNEL_TEST_SCREEN:
         return UINT8_C(0x28);
+    case KERNEL_TEST_KEYBOARD:
+        return UINT8_C(0x29);
     default:
         return QEMU_FAILURE_VALUE;
     }
@@ -2419,6 +2426,176 @@ static void thread_guard_scenario(void)
  * boot proof draws nine letters; a glyph table with one bad row in the middle
  * of it would pass that and fail this.
  */
+/*
+ * The keyboard, taken apart where boot cannot.
+ *
+ * prove_keyboard injects five scancodes and checks three characters come out.
+ * What it cannot do is fill the queue, because boot needs the keyboard working
+ * afterwards, and it cannot toggle caps lock, because that would leave the
+ * machine in a state the rest of boot did not ask for. Nothing after this
+ * scenario needs a keyboard, so this can do both.
+ */
+static void keyboard_scenario(void)
+{
+    struct keyboard_state before;
+    struct keyboard_state after;
+    struct keyboard_event event;
+    size_t drained = 0U;
+
+    if (!keyboard_is_initialized()) {
+        kernel_test_fail("the keyboard scenario has no keyboard");
+    }
+
+    /* Bringing it up twice is refused. Boot only ever does it once. */
+    if (keyboard_initialize() != KEYBOARD_STATUS_ALREADY_INITIALIZED) {
+        kernel_test_fail("the keyboard was brought up twice");
+    }
+
+    /* Drain whatever boot's proof left, so the counts below start clean. */
+    while (keyboard_read(&event) == KEYBOARD_STATUS_OK) {
+        drained += 1U;
+
+        if (drained > 4096U) {
+            kernel_test_fail("the keyboard queue would not drain");
+        }
+    }
+
+    if (keyboard_read(&event) != KEYBOARD_STATUS_EMPTY) {
+        kernel_test_fail("an empty keyboard queue did not say so");
+    }
+
+    if (keyboard_read(NULL) == KEYBOARD_STATUS_OK) {
+        kernel_test_fail("the keyboard wrote an event through a null pointer");
+    }
+
+    /*
+     * Caps lock, which boot deliberately does not touch. It is a toggle on
+     * press only, it applies to letters and not to digits, and a second press
+     * undoes it.
+     */
+    before = keyboard_get_state();
+
+    if (before.caps_lock) {
+        kernel_test_fail("caps lock was already latched");
+    }
+
+    cpu_interrupt_enable();
+
+    if (keyboard_inject_scancode(0x3AU) != KEYBOARD_STATUS_OK ||
+        keyboard_inject_scancode(0x1EU) != KEYBOARD_STATUS_OK) {
+        cpu_interrupt_disable();
+        kernel_test_fail("the controller refused an injected scancode");
+    }
+
+    for (uint64_t spins = 0; spins < UINT64_C(200000000); ++spins) {
+        if (keyboard_get_state().events >= before.events + 2U) {
+            break;
+        }
+    }
+
+    cpu_interrupt_disable();
+
+    if (!keyboard_get_state().caps_lock) {
+        kernel_test_fail("caps lock did not latch on press");
+    }
+
+    /* The 'a' after it must have arrived capitalised. */
+    while (keyboard_read(&event) == KEYBOARD_STATUS_OK) {
+        if (event.character == '\0') {
+            continue;
+        }
+
+        if (event.character != 'A') {
+            kernel_test_fail("caps lock did not capitalise the next letter");
+        }
+    }
+
+    if (keyboard_character_for(0x02U, false, true) != '1') {
+        kernel_test_fail("caps lock changed a digit");
+    }
+
+    cpu_interrupt_enable();
+
+    if (keyboard_inject_scancode(0x3AU) != KEYBOARD_STATUS_OK) {
+        cpu_interrupt_disable();
+        kernel_test_fail("the controller refused the second caps lock");
+    }
+
+    for (uint64_t spins = 0; spins < UINT64_C(200000000); ++spins) {
+        if (!keyboard_get_state().caps_lock) {
+            break;
+        }
+    }
+
+    cpu_interrupt_disable();
+
+    if (keyboard_get_state().caps_lock) {
+        kernel_test_fail("caps lock did not release on a second press");
+    }
+
+    while (keyboard_read(&event) == KEYBOARD_STATUS_OK) {
+        /* discard */
+    }
+
+    /*
+     * Overflow. The queue holds sixty-four minus one; more than that must be
+     * counted as dropped rather than silently overwriting what is waiting.
+     * Interrupts stay off so nothing is consumed while it fills.
+     */
+    before = keyboard_get_state();
+
+    if (before.dropped != 0U) {
+        kernel_test_fail("the keyboard had already dropped an event");
+    }
+
+    /*
+     * Interrupts stay on for the whole flood. An earlier version toggled them
+     * around each injection, which delivered nothing at all: sti does not take
+     * effect until after the instruction following it, so sti immediately
+     * followed by cli leaves a window of exactly zero instructions. The
+     * controller holds one byte, so each injection has to be taken by the
+     * handler before the next will land, and the bounded wait inside
+     * keyboard_inject_scancode is what gives it the chance.
+     */
+    cpu_interrupt_enable();
+
+    for (uint32_t index = 0; index < 200U; ++index) {
+        if (keyboard_inject_scancode(0x1EU) != KEYBOARD_STATUS_OK) {
+            cpu_interrupt_disable();
+            kernel_test_fail("the controller refused a flood of scancodes");
+        }
+    }
+
+    for (uint64_t spins = 0; spins < UINT64_C(200000000); ++spins) {
+        const struct keyboard_state now = keyboard_get_state();
+
+        if (now.events + now.dropped >= before.events + 200U) {
+            break;
+        }
+    }
+
+    cpu_interrupt_disable();
+    after = keyboard_get_state();
+
+    if (after.queued > 64U) {
+        kernel_test_fail("the keyboard queue grew past its bound");
+    }
+
+    if (after.dropped == 0U) {
+        kernel_test_fail("a flooded keyboard queue dropped nothing");
+    }
+
+    if (after.events + after.dropped < before.events + 200U) {
+        kernel_test_fail("the keyboard lost events it never accounted for");
+    }
+
+    console_write("Seneri OS: keyboard scenario queued ");
+    console_write_u64((uint64_t)after.queued);
+    console_write(" and dropped ");
+    console_write_u64(after.dropped - before.dropped);
+    console_write(" of a 200 event flood\n");
+}
+
 static void screen_scenario(void)
 {
     struct screen_state before;
@@ -2850,6 +3027,9 @@ void kernel_test_run(
     case KERNEL_TEST_SCREEN:
         screen_scenario();
         kernel_test_pass();
+    case KERNEL_TEST_KEYBOARD:
+        keyboard_scenario();
+        kernel_test_pass();
     case KERNEL_TEST_DOUBLE_FAULT:
         kernel_test_double_fault_armed = 1U;
         interrupt_test_set_gate_present(14U, false);
@@ -2981,6 +3161,8 @@ const char *kernel_test_scenario_name(enum kernel_test_scenario scenario)
         return "framebuffer";
     case KERNEL_TEST_SCREEN:
         return "screen";
+    case KERNEL_TEST_KEYBOARD:
+        return "keyboard";
     case KERNEL_TEST_INVALID:
         return "invalid";
     default:

@@ -34,6 +34,7 @@
 #include <seneri/interrupts.h>
 #include <seneri/logo.h>
 #include <seneri/ioapic.h>
+#include <seneri/keyboard.h>
 #include <seneri/memory.h>
 #include <seneri/paging.h>
 #include <seneri/pci.h>
@@ -1826,4 +1827,128 @@ void prove_screen_console(void)
     console_write_u64(after.scrolls);
     console_write(" times\n");
     console_write("Seneri OS: screen console established\n");
+}
+
+/*
+ * The keyboard, proved without a person at the machine.
+ *
+ * Every other device Seneri brings up either announces itself or can be asked a
+ * question. A keyboard does neither: it says nothing until somebody presses a
+ * key, and boot cannot wait for that.
+ *
+ * The way through is a real controller command rather than a test hook. 8042
+ * command 0xD2 writes a byte into the output buffer exactly as though the
+ * keyboard had sent it, which raises IRQ 1. So the whole path is exercised for
+ * real - controller, I/O APIC routing, vector, handler, decode, queue - and the
+ * only thing simulated is the finger.
+ */
+void prove_keyboard(void)
+{
+    /* 'h', 'i', then left shift down, 'i' again, and shift up: "hiI". */
+    static const uint8_t script[] = {
+        0x23U, 0x17U, 0x2AU, 0x17U, (uint8_t)(0x2AU | 0x80U)
+    };
+    static const char expected[] = "hiI";
+
+    struct keyboard_state before;
+    struct keyboard_state after;
+    struct keyboard_event event;
+    enum keyboard_status status;
+    size_t characters = 0U;
+    char seen[8];
+
+    status = keyboard_initialize();
+
+    if (status != KEYBOARD_STATUS_OK) {
+        console_panic(keyboard_status_string(status));
+    }
+
+    before = keyboard_get_state();
+
+    if (before.queued != 0U) {
+        console_panic("the keyboard queue was not empty at bring-up");
+    }
+
+    /*
+     * Interrupts have to be on for this to prove anything: the whole point is
+     * that the bytes arrive through IRQ 1 rather than by being polled.
+     */
+    cpu_interrupt_enable();
+
+    for (size_t index = 0; index < sizeof(script); ++index) {
+        status = keyboard_inject_scancode(script[index]);
+
+        if (status != KEYBOARD_STATUS_OK) {
+            cpu_interrupt_disable();
+            console_panic(keyboard_status_string(status));
+        }
+    }
+
+    /*
+     * Bounded, like every other wait in this kernel. A keyboard that never
+     * delivers must fail the boot rather than hang it.
+     */
+    for (uint64_t spins = 0; spins < UINT64_C(200000000); ++spins) {
+        if (keyboard_get_state().events >= sizeof(script)) {
+            break;
+        }
+    }
+
+    cpu_interrupt_disable();
+    after = keyboard_get_state();
+
+    if (after.interrupts == before.interrupts) {
+        console_panic("the keyboard delivered no interrupt");
+    }
+
+    if (after.events < sizeof(script)) {
+        console_panic("the keyboard lost an injected scancode");
+    }
+
+    if (after.dropped != 0U) {
+        console_panic("the keyboard queue overflowed during its own proof");
+    }
+
+    while (keyboard_read(&event) == KEYBOARD_STATUS_OK) {
+        if (event.character == '\0') {
+            continue;
+        }
+
+        if (characters >= sizeof(seen)) {
+            console_panic("the keyboard produced more characters than it was sent");
+        }
+
+        seen[characters] = event.character;
+        characters += 1U;
+    }
+
+    if (characters != sizeof(expected) - 1U) {
+        console_panic("the keyboard produced the wrong number of characters");
+    }
+
+    for (size_t index = 0; index < characters; ++index) {
+        if (seen[index] != expected[index]) {
+            console_panic("the keyboard decoded a scancode to the wrong character");
+        }
+    }
+
+    /*
+     * The shift released above must have left no residue. A modifier that
+     * stayed down would capitalise everything typed afterwards.
+     */
+    if (after.shift) {
+        console_panic("the keyboard left shift held after its release");
+    }
+
+    console_write("Seneri OS: keyboard 8042 online, IRQ 1 routed, ");
+    console_write_u64(after.interrupts - before.interrupts);
+    console_write(" interrupts for ");
+    console_write_u64(after.events);
+    console_write(" events\n");
+    console_write("Seneri OS: keyboard decoded \"");
+    for (size_t index = 0; index < characters; ++index) {
+        console_putc(seen[index]);
+    }
+    console_write("\" from injected scancodes\n");
+    console_write("Seneri OS: keyboard established\n");
 }
