@@ -154,6 +154,8 @@ make hooks    # enforce verification in this local clone
 - `docs/RUST.md` — the one component that is not C, and where that line goes.
 - `docs/DEBT.md` — a measured register of what the whole thing is carrying.
 - `docs/NEVER_TRIPLE_FAULT.md` — interrupt ABI, invariants, and test protocol.
+- `docs/WORKING_ON_SENERI.md` — how to change a layer and get it onto `main`,
+  alone, including what to do when the build refuses you.
 - `CONTRIBUTING.md` — non-negotiable engineering and commit rules.
 
 ## Current boundaries
