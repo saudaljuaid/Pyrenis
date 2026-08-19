@@ -277,12 +277,20 @@ const char *acpi_status_string(enum acpi_status status)
         "ACPI FADT declares no usable timer block length",
         "ACPI FADT declares no power management timer address",
         "ACPI FADT extended timer block is malformed",
-        "ACPI power management timer port is outside the I/O space"
+        "ACPI power management timer port is outside the I/O space",
+        "ACPI root table does not contain an MCFG",
+        "ACPI root table contains duplicate MCFGs",
+        "ACPI MCFG length is not a whole number of allocations",
+        "ACPI MCFG declares no configuration window",
+        "ACPI MCFG exceeds the early configuration window limit",
+        "ACPI MCFG configuration window ends before it starts",
+        "ACPI MCFG configuration window base is unusable",
+        "ACPI MCFG configuration windows overlap"
     };
 
     _Static_assert(
         sizeof(messages) / sizeof(messages[0]) ==
-            (size_t)ACPI_STATUS_BAD_PM_TIMER_PORT + 1U,
+            (size_t)ACPI_STATUS_OVERLAPPING_ECAM_RANGE + 1U,
         "ACPI status messages are out of sync"
     );
 

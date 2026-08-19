@@ -1,4 +1,5 @@
 /* SPDX-License-Identifier: GPL-3.0-only */
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -54,6 +55,13 @@ _Noreturn void kernel_main(uint32_t magic, uintptr_t boot_information);
  * than early boot should place on the 16 KiB kernel stack.
  */
 static struct acpi_topology boot_topology;
+
+/*
+ * The configuration window description, kept for the same reason: it outlives
+ * kernel_main's frame and src/kernel/pci.c reads it after boot.
+ */
+static struct acpi_mcfg boot_mcfg;
+static bool boot_mcfg_present;
 
 static void report_boot_context(const struct boot_context *context)
 {
@@ -159,6 +167,43 @@ static void report_pm_timer(const struct pm_timer_state *pm_timer)
     console_write(" bits address ");
     console_write(pm_timer->extended_address ? "extended" : "fixed");
     console_putc('\n');
+}
+
+/*
+ * The one firmware table Seneri reads whose absence is not a fault. A machine
+ * with no PCI Express host bridge publishes no MCFG, and configuration space is
+ * still reachable through the I/O ports the PCI specification has always
+ * defined, so absence is reported and boot continues.
+ */
+static void report_acpi_mcfg(const struct acpi_mcfg *mcfg, bool present)
+{
+    if (!present) {
+        console_write("Seneri OS: ACPI MCFG absent\n");
+        return;
+    }
+
+    console_write("Seneri OS: ACPI MCFG at ");
+    console_write_hex(mcfg->physical_address);
+    console_write(" windows ");
+    console_write_u64(mcfg->allocation_count);
+    console_putc('\n');
+
+    for (size_t index = 0; index < mcfg->allocation_count; ++index) {
+        const struct acpi_ecam_allocation *allocation =
+            &mcfg->allocations[index];
+
+        console_write("Seneri OS: ACPI ECAM segment ");
+        console_write_u64(allocation->segment);
+        console_write(" base ");
+        console_write_hex(allocation->base_address);
+        console_write(" buses ");
+        console_write_u64(allocation->start_bus);
+        console_write(" to ");
+        console_write_u64(allocation->end_bus);
+        console_write(" size ");
+        console_write_u64(acpi_ecam_allocation_size(allocation));
+        console_putc('\n');
+    }
 }
 
 static void report_acpi_topology(const struct acpi_topology *topology)
@@ -1117,6 +1162,22 @@ _Noreturn void kernel_main(uint32_t magic, uintptr_t boot_information)
         console_panic(acpi_status_string(acpi_status));
     }
 
+    /*
+     * The MCFG is optional, so its absence is recorded rather than fatal, and
+     * every other refusal is still a refusal. Discovering it here keeps every
+     * firmware table read through the early identity map before paging takes
+     * ownership of the address space.
+     */
+    acpi_status = acpi_mcfg_discover(&acpi_root, &boot_mcfg);
+
+    if (acpi_status == ACPI_STATUS_MISSING_MCFG) {
+        boot_mcfg_present = false;
+    } else if (acpi_status != ACPI_STATUS_OK) {
+        console_panic(acpi_status_string(acpi_status));
+    } else {
+        boot_mcfg_present = true;
+    }
+
     pm_timer_status = pm_timer_initialize(&acpi_fadt);
 
     if (pm_timer_status != PM_TIMER_STATUS_OK) {
@@ -1130,10 +1191,12 @@ _Noreturn void kernel_main(uint32_t magic, uintptr_t boot_information)
     pm_timer_state = pm_timer_get_state();
     report_acpi_fadt(&acpi_fadt);
     report_pm_timer(&pm_timer_state);
+    report_acpi_mcfg(&boot_mcfg, boot_mcfg_present);
     console_write("Seneri OS: ACPI root verified\n");
     console_write("Seneri OS: ACPI MADT verified\n");
     console_write("Seneri OS: ACPI topology verified\n");
     console_write("Seneri OS: ACPI FADT verified\n");
+    console_write("Seneri OS: ACPI configuration windows verified\n");
     apic_status = apic_bring_online(&boot_topology);
 
     if (apic_status != APIC_STATUS_OK) {

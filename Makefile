@@ -165,6 +165,8 @@ qemu-test-%: $(TEST_BUILD_DIR)/%/seneri.iso
 		  ! grep -Eq '^Seneri OS: TSC calibrated at [0-9]+ Hz' "$$log" || \
 		  ! grep -Fq 'Seneri OS: TSC reference established' "$$log" || \
 		  ! grep -Fq 'Seneri OS: ACPI FADT verified' "$$log" || \
+		  ! grep -Fq 'Seneri OS: ACPI MCFG absent' "$$log" || \
+		  ! grep -Fq 'Seneri OS: ACPI configuration windows verified' "$$log" || \
 		  ! grep -Eq '^Seneri OS: ACPI PM timer port 0x[0-9A-F]+ width (24|32) bits address (fixed|extended)$$' "$$log" || \
 		  ! grep -Eq '^Seneri OS: PM timer counted [0-9]+ ticks in [0-9]+ ns$$' "$$log" || \
 		  ! grep -Fq 'Seneri OS: PM timer independent reference established' "$$log" || \

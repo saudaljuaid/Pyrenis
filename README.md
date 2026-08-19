@@ -57,6 +57,7 @@ Seneri OS: timer survives legacy retirement
 Seneri OS: local APIC timer delivered eight interrupts
 Seneri OS: TSC reference established
 Seneri OS: ACPI FADT verified
+Seneri OS: ACPI configuration windows verified
 Seneri OS: PM timer independent reference established
 Seneri OS: PIT retired
 Seneri OS: clocks survive PIT retirement
@@ -99,7 +100,8 @@ make hooks    # enforce verification in this local clone
 - `src/kernel/multiboot2.c` — bounded parser for the boot information contract.
 - `src/kernel/physical_memory.c` — 4 KiB physical-frame ownership and allocation.
 - `src/kernel/acpi.c` — defensive ACPI RSDP validation and root discovery.
-- `src/kernel/acpi_tables.c` — bounded RSDT/XSDT walking, MADT and FADT discovery.
+- `src/kernel/acpi_tables.c` — bounded RSDT/XSDT walking, MADT, FADT and MCFG
+  discovery.
 - `src/kernel/acpi_madt.c` — bounded MADT record walking and interrupt topology.
 - `src/kernel/acpi_util.c` — shared firmware-table primitives and wire sizes.
 - `src/kernel/apic.c` — local APIC bring-up, virtual wire routing, and identity.

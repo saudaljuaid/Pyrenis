@@ -50,6 +50,26 @@ _Static_assert(FADT_OFFSET_PM_TMR_LEN < FADT_MINIMUM_SIZE,
 _Static_assert(FADT_OFFSET_FLAGS + sizeof(uint32_t) <= FADT_MINIMUM_SIZE,
                "FLAGS no longer fits inside an ACPI 1.0 FADT");
 
+/*
+ * PCI Firmware Specification 3.3 table 4-2 places the allocation structures
+ * after the description header and eight reserved bytes, and gives each one a
+ * 64-bit base address, a 16-bit segment group, a start and an end bus number,
+ * and four reserved bytes.
+ */
+#define MCFG_OFFSET_BASE_ADDRESS 0U
+#define MCFG_OFFSET_SEGMENT 8U
+#define MCFG_OFFSET_START_BUS 10U
+#define MCFG_OFFSET_END_BUS 11U
+
+_Static_assert(
+    MCFG_OFFSET_END_BUS < ACPI_MCFG_ALLOCATION_SIZE,
+    "an MCFG allocation field no longer fits inside an allocation structure"
+);
+_Static_assert(
+    ACPI_MCFG_FIXED_SIZE > ACPI_SDT_HEADER_SIZE,
+    "the MCFG reserved field no longer follows the description header"
+);
+
 struct acpi_sdt_header {
     char signature[4];
     uint32_t length;
@@ -92,20 +112,36 @@ struct acpi_test_fadt {
     uint8_t body[ACPI_TEST_FADT_SIZE - ACPI_SDT_HEADER_SIZE];
 } __attribute__((packed));
 
+/*
+ * Two allocation structures, which is one more than any machine Seneri is
+ * tested on declares. The second exists so the overlap rejection has something
+ * to reject against.
+ */
+#define ACPI_TEST_MCFG_ALLOCATIONS 2U
+#define ACPI_TEST_MCFG_SIZE \
+    (ACPI_MCFG_FIXED_SIZE + \
+        ACPI_TEST_MCFG_ALLOCATIONS * ACPI_MCFG_ALLOCATION_SIZE)
+
+struct acpi_test_mcfg {
+    struct acpi_sdt_header header;
+    uint8_t body[ACPI_TEST_MCFG_SIZE - ACPI_SDT_HEADER_SIZE];
+} __attribute__((packed));
+
 struct acpi_test_xsdt {
     struct acpi_sdt_header header;
-    uint64_t entries[3];
+    uint64_t entries[4];
 } __attribute__((packed));
 
 struct acpi_test_rsdt {
     struct acpi_sdt_header header;
-    uint32_t entries[3];
+    uint32_t entries[4];
 } __attribute__((packed));
 
 struct acpi_test_fixture {
     struct acpi_test_table other;
     struct acpi_test_madt madt;
     struct acpi_test_fadt fadt;
+    struct acpi_test_mcfg mcfg;
     struct acpi_test_xsdt xsdt;
     struct acpi_test_rsdt rsdt;
 } __attribute__((aligned(8)));
@@ -124,12 +160,16 @@ _Static_assert(offsetof(struct acpi_madt_table, flags) == 40U,
                "ACPI MADT flags offset changed");
 _Static_assert(sizeof(struct acpi_test_fadt) == ACPI_TEST_FADT_SIZE,
                "ACPI FADT fixture no longer spans the extended timer address");
+_Static_assert(sizeof(struct acpi_test_mcfg) == ACPI_TEST_MCFG_SIZE,
+               "ACPI MCFG fixture no longer spans its allocation structures");
 
 static const char rsdt_signature[4] = {'R', 'S', 'D', 'T'};
 static const char xsdt_signature[4] = {'X', 'S', 'D', 'T'};
 static const char madt_signature[4] = {'A', 'P', 'I', 'C'};
 /* ACPI 6.6 section 5.2.9 signs the fixed description table FACP, not FADT. */
 static const char fadt_signature[4] = {'F', 'A', 'C', 'P'};
+/* PCI Firmware Specification 3.3 section 4.1.2 signs this table MCFG. */
+static const char mcfg_signature[4] = {'M', 'C', 'F', 'G'};
 static const char test_signature[4] = {'T', 'E', 'S', 'T'};
 static const char test_oem_id[6] = {'Z', 'E', 'N', 'I', 'T', 'H'};
 static const char test_oem_table_id[8] = {'Z', 'T', 'T', 'A', 'B', 'L', 'E', 'S'};
@@ -168,6 +208,29 @@ static void fadt_reset(struct acpi_fadt *fadt)
 
     for (size_t index = 0; index < sizeof(fadt->oem_table_id); ++index) {
         fadt->oem_table_id[index] = '\0';
+    }
+}
+
+static void mcfg_reset(struct acpi_mcfg *mcfg)
+{
+    mcfg->physical_address = 0U;
+    mcfg->length = 0U;
+    mcfg->allocation_count = 0U;
+    mcfg->revision = 0U;
+
+    for (size_t index = 0; index < sizeof(mcfg->oem_id); ++index) {
+        mcfg->oem_id[index] = '\0';
+    }
+
+    for (size_t index = 0; index < sizeof(mcfg->oem_table_id); ++index) {
+        mcfg->oem_table_id[index] = '\0';
+    }
+
+    for (size_t index = 0; index < ACPI_MAX_ECAM_ALLOCATIONS; ++index) {
+        mcfg->allocations[index].base_address = 0U;
+        mcfg->allocations[index].segment = 0U;
+        mcfg->allocations[index].start_bus = 0U;
+        mcfg->allocations[index].end_bus = 0U;
     }
 }
 
@@ -548,6 +611,192 @@ enum acpi_status acpi_fadt_discover(
     return ACPI_STATUS_OK;
 }
 
+uint64_t acpi_ecam_allocation_size(
+    const struct acpi_ecam_allocation *allocation
+)
+{
+    if (allocation == NULL) {
+        return 0U;
+    }
+
+    /*
+     * end_bus is inclusive, and both are eight bits, so the count is at most
+     * 256 and the product at most 256 MiB. Computed in 64 bits because the
+     * eight-bit difference plus one would overflow a uint8_t at the full range.
+     */
+    return ((uint64_t)allocation->end_bus - allocation->start_bus + 1U) *
+        ACPI_ECAM_BUS_SIZE;
+}
+
+/*
+ * Two windows conflict if they describe the same buses of the same segment
+ * group, or if they occupy the same memory whatever they claim to describe.
+ * Either way one of them is wrong, and picking whichever came first would
+ * silently address the wrong device.
+ */
+static bool ecam_allocations_conflict(
+    const struct acpi_ecam_allocation *left,
+    const struct acpi_ecam_allocation *right
+)
+{
+    const uint64_t left_end = left->base_address +
+        acpi_ecam_allocation_size(left);
+    const uint64_t right_end = right->base_address +
+        acpi_ecam_allocation_size(right);
+
+    if (left->segment == right->segment &&
+        left->start_bus <= right->end_bus &&
+        right->start_bus <= left->end_bus) {
+        return true;
+    }
+
+    return left->base_address < right_end && right->base_address < left_end;
+}
+
+static enum acpi_status decode_ecam_allocations(
+    const uint8_t *table,
+    uint32_t length,
+    struct acpi_mcfg *mcfg
+)
+{
+    const uint8_t *records = table + ACPI_MCFG_FIXED_SIZE;
+    uint32_t payload;
+    size_t count;
+
+    if (length < ACPI_MCFG_FIXED_SIZE) {
+        return ACPI_STATUS_BAD_MCFG_LENGTH;
+    }
+
+    payload = length - ACPI_MCFG_FIXED_SIZE;
+
+    /*
+     * A table whose payload is not a whole number of allocation structures
+     * describes a layout this reader does not know, so it is refused rather
+     * than truncated to the part that happens to fit.
+     */
+    if (payload % ACPI_MCFG_ALLOCATION_SIZE != 0U) {
+        return ACPI_STATUS_BAD_MCFG_LENGTH;
+    }
+
+    count = payload / ACPI_MCFG_ALLOCATION_SIZE;
+
+    if (count == 0U) {
+        return ACPI_STATUS_NO_ECAM_ALLOCATIONS;
+    }
+
+    if (count > ACPI_MAX_ECAM_ALLOCATIONS) {
+        return ACPI_STATUS_TOO_MANY_ECAM_ALLOCATIONS;
+    }
+
+    for (size_t index = 0; index < count; ++index) {
+        const uint8_t *record = records + index * ACPI_MCFG_ALLOCATION_SIZE;
+        struct acpi_ecam_allocation allocation;
+        uint64_t size;
+
+        allocation.base_address =
+            acpi_read_u64(record + MCFG_OFFSET_BASE_ADDRESS);
+        allocation.segment = acpi_read_u16(record + MCFG_OFFSET_SEGMENT);
+        allocation.start_bus = record[MCFG_OFFSET_START_BUS];
+        allocation.end_bus = record[MCFG_OFFSET_END_BUS];
+
+        if (allocation.end_bus < allocation.start_bus) {
+            return ACPI_STATUS_BAD_ECAM_BUS_RANGE;
+        }
+
+        /*
+         * Zero is not an address a host bridge decodes, and a base that is not
+         * 1 MiB aligned cannot carry the bus number in address bits 27:20, so
+         * the addressing this window exists for would not work at all.
+         */
+        if (allocation.base_address == 0U ||
+            allocation.base_address % ACPI_ECAM_BUS_SIZE != 0U) {
+            return ACPI_STATUS_BAD_ECAM_BASE;
+        }
+
+        size = acpi_ecam_allocation_size(&allocation);
+
+        if (allocation.base_address > UINT64_MAX - size) {
+            return ACPI_STATUS_BAD_ECAM_BASE;
+        }
+
+        for (size_t earlier = 0; earlier < index; ++earlier) {
+            if (ecam_allocations_conflict(
+                    &mcfg->allocations[earlier],
+                    &allocation
+                )) {
+                return ACPI_STATUS_OVERLAPPING_ECAM_RANGE;
+            }
+        }
+
+        mcfg->allocations[index] = allocation;
+    }
+
+    mcfg->allocation_count = count;
+    return ACPI_STATUS_OK;
+}
+
+/*
+ * Discover the memory-mapped configuration window firmware advertises.
+ *
+ * This is the first optional table Seneri reads. A machine with no PCI Express
+ * host bridge publishes no MCFG, and that is a fact about the machine rather
+ * than a fault: ACPI_STATUS_MISSING_MCFG is returned and the caller decides
+ * whether it can proceed without one. Everything else here is refused for the
+ * same reason every other firmware table is - a window described wrongly would
+ * be read as a device that is not there.
+ */
+enum acpi_status acpi_mcfg_discover(
+    const struct acpi_root *root,
+    struct acpi_mcfg *mcfg
+)
+{
+    const struct acpi_sdt_header *header;
+    uint64_t physical_address = 0U;
+    size_t entry_count = 0U;
+    enum acpi_status status;
+
+    if (root == NULL || mcfg == NULL) {
+        return ACPI_STATUS_NULL_ARGUMENT;
+    }
+
+    mcfg_reset(mcfg);
+    status = find_unique_table(
+        root,
+        mcfg_signature,
+        ACPI_STATUS_MISSING_MCFG,
+        ACPI_STATUS_DUPLICATE_MCFG,
+        &header,
+        &physical_address,
+        &entry_count
+    );
+
+    if (status != ACPI_STATUS_OK) {
+        return status;
+    }
+
+    status = decode_ecam_allocations(
+        (const uint8_t *)(const void *)header,
+        header->length,
+        mcfg
+    );
+
+    if (status != ACPI_STATUS_OK) {
+        mcfg_reset(mcfg);
+        return status;
+    }
+
+    mcfg->physical_address = physical_address;
+    mcfg->length = header->length;
+    mcfg->revision = header->revision;
+    acpi_copy_string(mcfg->oem_id, header->oem_id, sizeof(header->oem_id));
+    acpi_copy_string(
+        mcfg->oem_table_id,
+        header->oem_table_id,
+        sizeof(header->oem_table_id)
+    );
+    return ACPI_STATUS_OK;
+}
+
 static void initialize_header(
     struct acpi_sdt_header *header,
     const char signature[4],
@@ -588,6 +837,17 @@ static void set_checksum(void *table, size_t size)
 #define TEST_PM_TIMER_EXTENDED_PORT UINT64_C(0x1008)
 
 /*
+ * The fixture's synthetic configuration windows. Both are 1 MiB aligned and
+ * cover four buses each, and the second sits far enough above the first that
+ * only a deliberate edit can make them overlap.
+ */
+#define TEST_ECAM_BASE UINT64_C(0xE0000000)
+#define TEST_ECAM_SECOND_BASE UINT64_C(0xE8000000)
+#define TEST_ECAM_SEGMENT UINT16_C(0)
+#define TEST_ECAM_SECOND_SEGMENT UINT16_C(1)
+#define TEST_ECAM_END_BUS UINT8_C(3)
+
+/*
  * Firmware tables are little-endian on the wire wherever they sit, and the
  * fixture writes the same fields acpi_read_* reads back, so it builds them a
  * byte at a time rather than trusting the host layout of a wider store.
@@ -606,10 +866,28 @@ static void write_u64(uint8_t *bytes, uint64_t value)
     }
 }
 
+static void write_u16(uint8_t *bytes, uint16_t value)
+{
+    for (size_t index = 0; index < sizeof(value); ++index) {
+        bytes[index] = (uint8_t)(value >> (index * 8U));
+    }
+}
+
 /* Address a FADT field by its offset from the start of the table. */
 static uint8_t *fadt_field(struct acpi_test_fadt *fadt, size_t offset)
 {
     return (uint8_t *)(void *)fadt + offset;
+}
+
+/* Address a field of one MCFG allocation structure by allocation and offset. */
+static uint8_t *mcfg_field(
+    struct acpi_test_mcfg *mcfg,
+    size_t allocation,
+    size_t offset
+)
+{
+    return (uint8_t *)(void *)mcfg + ACPI_MCFG_FIXED_SIZE +
+        allocation * ACPI_MCFG_ALLOCATION_SIZE + offset;
 }
 
 static void prepare_test_fixture(struct acpi_test_fixture *fixture)
@@ -657,6 +935,34 @@ static void prepare_test_fixture(struct acpi_test_fixture *fixture)
     set_checksum(&fixture->fadt, sizeof(fixture->fadt));
 
     initialize_header(
+        &fixture->mcfg.header,
+        mcfg_signature,
+        sizeof(fixture->mcfg)
+    );
+    fixture->mcfg.header.revision = 1U;
+    write_u64(
+        mcfg_field(&fixture->mcfg, 0U, MCFG_OFFSET_BASE_ADDRESS),
+        TEST_ECAM_BASE
+    );
+    write_u16(
+        mcfg_field(&fixture->mcfg, 0U, MCFG_OFFSET_SEGMENT),
+        TEST_ECAM_SEGMENT
+    );
+    *mcfg_field(&fixture->mcfg, 0U, MCFG_OFFSET_START_BUS) = 0U;
+    *mcfg_field(&fixture->mcfg, 0U, MCFG_OFFSET_END_BUS) = TEST_ECAM_END_BUS;
+    write_u64(
+        mcfg_field(&fixture->mcfg, 1U, MCFG_OFFSET_BASE_ADDRESS),
+        TEST_ECAM_SECOND_BASE
+    );
+    write_u16(
+        mcfg_field(&fixture->mcfg, 1U, MCFG_OFFSET_SEGMENT),
+        TEST_ECAM_SECOND_SEGMENT
+    );
+    *mcfg_field(&fixture->mcfg, 1U, MCFG_OFFSET_START_BUS) = 0U;
+    *mcfg_field(&fixture->mcfg, 1U, MCFG_OFFSET_END_BUS) = TEST_ECAM_END_BUS;
+    set_checksum(&fixture->mcfg, sizeof(fixture->mcfg));
+
+    initialize_header(
         &fixture->xsdt.header,
         xsdt_signature,
         sizeof(fixture->xsdt)
@@ -667,6 +973,8 @@ static void prepare_test_fixture(struct acpi_test_fixture *fixture)
         (uint64_t)(uintptr_t)(void *)&fixture->madt;
     fixture->xsdt.entries[2] =
         (uint64_t)(uintptr_t)(void *)&fixture->fadt;
+    fixture->xsdt.entries[3] =
+        (uint64_t)(uintptr_t)(void *)&fixture->mcfg;
     set_checksum(&fixture->xsdt, sizeof(fixture->xsdt));
 
     initialize_header(
@@ -680,6 +988,8 @@ static void prepare_test_fixture(struct acpi_test_fixture *fixture)
         (uint32_t)(uintptr_t)(void *)&fixture->madt;
     fixture->rsdt.entries[2] =
         (uint32_t)(uintptr_t)(void *)&fixture->fadt;
+    fixture->rsdt.entries[3] =
+        (uint32_t)(uintptr_t)(void *)&fixture->mcfg;
     set_checksum(&fixture->rsdt, sizeof(fixture->rsdt));
 }
 
@@ -715,7 +1025,7 @@ static bool valid_fixture_is_accepted(void)
         madt.length != sizeof(fixture.madt) ||
         madt.local_apic_address != UINT32_C(0xFEE00000) ||
         madt.flags != ACPI_MADT_PCAT_COMPAT ||
-        madt.root_entry_count != 3U ||
+        madt.root_entry_count != 4U ||
         madt.revision != 7U ||
         !acpi_bytes_equal(madt.oem_id, test_oem_id, sizeof(test_oem_id)) ||
         !acpi_bytes_equal(
@@ -970,13 +1280,198 @@ static bool fadt_rejections_are_refused(void)
     return acpi_fadt_discover(&root, &fadt) == ACPI_STATUS_DUPLICATE_FADT;
 }
 
+/*
+ * Every MCFG rejection, driven by editing a fixture that is otherwise accepted,
+ * so each check is reached with everything before it valid. The first case is
+ * the acceptance, which is what makes the rest of them mean anything.
+ */
+static bool valid_mcfg_is_accepted(void)
+{
+    struct acpi_test_fixture fixture;
+    struct acpi_mcfg mcfg;
+    struct acpi_root root;
+
+    prepare_test_fixture(&fixture);
+    root = test_root(&fixture, ACPI_ROOT_XSDT);
+
+    if (acpi_mcfg_discover(&root, &mcfg) != ACPI_STATUS_OK ||
+        mcfg.physical_address != (uint64_t)(uintptr_t)(void *)&fixture.mcfg ||
+        mcfg.length != sizeof(fixture.mcfg) ||
+        mcfg.revision != 1U ||
+        mcfg.allocation_count != ACPI_TEST_MCFG_ALLOCATIONS ||
+        mcfg.allocations[0].base_address != TEST_ECAM_BASE ||
+        mcfg.allocations[0].segment != TEST_ECAM_SEGMENT ||
+        mcfg.allocations[0].start_bus != 0U ||
+        mcfg.allocations[0].end_bus != TEST_ECAM_END_BUS ||
+        mcfg.allocations[1].base_address != TEST_ECAM_SECOND_BASE ||
+        mcfg.allocations[1].segment != TEST_ECAM_SECOND_SEGMENT ||
+        !acpi_bytes_equal(mcfg.oem_id, test_oem_id, sizeof(test_oem_id))) {
+        return false;
+    }
+
+    if (acpi_ecam_allocation_size(&mcfg.allocations[0]) !=
+            ((uint64_t)TEST_ECAM_END_BUS + 1U) * ACPI_ECAM_BUS_SIZE ||
+        acpi_ecam_allocation_size(NULL) != 0U) {
+        return false;
+    }
+
+    /* The same table reached through the 32-bit root, which is a separate walk. */
+    root = test_root(&fixture, ACPI_ROOT_RSDT);
+    return acpi_mcfg_discover(&root, &mcfg) == ACPI_STATUS_OK &&
+        mcfg.allocation_count == ACPI_TEST_MCFG_ALLOCATIONS;
+}
+
+static bool mcfg_rejections_are_named(void)
+{
+    struct acpi_test_fixture fixture;
+    struct acpi_mcfg mcfg;
+    struct acpi_root root;
+
+    prepare_test_fixture(&fixture);
+    root = test_root(&fixture, ACPI_ROOT_XSDT);
+
+    if (acpi_mcfg_discover(NULL, &mcfg) != ACPI_STATUS_NULL_ARGUMENT ||
+        acpi_mcfg_discover(&root, NULL) != ACPI_STATUS_NULL_ARGUMENT) {
+        return false;
+    }
+
+    /*
+     * A payload that is not a whole number of allocation structures. The
+     * checksum is restored each time, so the length is what is being tested
+     * rather than the corruption editing it causes.
+     */
+    prepare_test_fixture(&fixture);
+    root = test_root(&fixture, ACPI_ROOT_XSDT);
+    fixture.mcfg.header.length = sizeof(fixture.mcfg) - 1U;
+    set_checksum(&fixture.mcfg, sizeof(fixture.mcfg) - 1U);
+
+    if (acpi_mcfg_discover(&root, &mcfg) != ACPI_STATUS_BAD_MCFG_LENGTH) {
+        return false;
+    }
+
+    /* A table that stops before its first allocation structure. */
+    prepare_test_fixture(&fixture);
+    root = test_root(&fixture, ACPI_ROOT_XSDT);
+    fixture.mcfg.header.length = ACPI_MCFG_FIXED_SIZE;
+    set_checksum(&fixture.mcfg, ACPI_MCFG_FIXED_SIZE);
+
+    if (acpi_mcfg_discover(&root, &mcfg) != ACPI_STATUS_NO_ECAM_ALLOCATIONS) {
+        return false;
+    }
+
+    /* A window whose last bus precedes its first. */
+    prepare_test_fixture(&fixture);
+    root = test_root(&fixture, ACPI_ROOT_XSDT);
+    *mcfg_field(&fixture.mcfg, 0U, MCFG_OFFSET_START_BUS) =
+        TEST_ECAM_END_BUS + 1U;
+    set_checksum(&fixture.mcfg, sizeof(fixture.mcfg));
+
+    if (acpi_mcfg_discover(&root, &mcfg) != ACPI_STATUS_BAD_ECAM_BUS_RANGE) {
+        return false;
+    }
+
+    prepare_test_fixture(&fixture);
+    root = test_root(&fixture, ACPI_ROOT_XSDT);
+    write_u64(mcfg_field(&fixture.mcfg, 0U, MCFG_OFFSET_BASE_ADDRESS), 0U);
+    set_checksum(&fixture.mcfg, sizeof(fixture.mcfg));
+
+    if (acpi_mcfg_discover(&root, &mcfg) != ACPI_STATUS_BAD_ECAM_BASE) {
+        return false;
+    }
+
+    /* One byte short of 1 MiB alignment, which is the whole addressing scheme. */
+    prepare_test_fixture(&fixture);
+    root = test_root(&fixture, ACPI_ROOT_XSDT);
+    write_u64(
+        mcfg_field(&fixture.mcfg, 0U, MCFG_OFFSET_BASE_ADDRESS),
+        TEST_ECAM_BASE + 1U
+    );
+    set_checksum(&fixture.mcfg, sizeof(fixture.mcfg));
+
+    if (acpi_mcfg_discover(&root, &mcfg) != ACPI_STATUS_BAD_ECAM_BASE) {
+        return false;
+    }
+
+    /*
+     * A base so high that its own bus range runs past the end of the address
+     * space. Refused rather than wrapped to a low address that reads as memory.
+     */
+    prepare_test_fixture(&fixture);
+    root = test_root(&fixture, ACPI_ROOT_XSDT);
+    write_u64(
+        mcfg_field(&fixture.mcfg, 0U, MCFG_OFFSET_BASE_ADDRESS),
+        UINT64_MAX - ACPI_ECAM_BUS_SIZE + 1U
+    );
+    set_checksum(&fixture.mcfg, sizeof(fixture.mcfg));
+
+    if (acpi_mcfg_discover(&root, &mcfg) != ACPI_STATUS_BAD_ECAM_BASE) {
+        return false;
+    }
+
+    /* Two windows of different segments placed on the same memory. */
+    prepare_test_fixture(&fixture);
+    root = test_root(&fixture, ACPI_ROOT_XSDT);
+    write_u64(
+        mcfg_field(&fixture.mcfg, 1U, MCFG_OFFSET_BASE_ADDRESS),
+        TEST_ECAM_BASE
+    );
+    set_checksum(&fixture.mcfg, sizeof(fixture.mcfg));
+
+    if (acpi_mcfg_discover(&root, &mcfg) !=
+        ACPI_STATUS_OVERLAPPING_ECAM_RANGE) {
+        return false;
+    }
+
+    /* Two windows of the same segment claiming the same buses. */
+    prepare_test_fixture(&fixture);
+    root = test_root(&fixture, ACPI_ROOT_XSDT);
+    write_u16(
+        mcfg_field(&fixture.mcfg, 1U, MCFG_OFFSET_SEGMENT),
+        TEST_ECAM_SEGMENT
+    );
+    set_checksum(&fixture.mcfg, sizeof(fixture.mcfg));
+
+    if (acpi_mcfg_discover(&root, &mcfg) !=
+        ACPI_STATUS_OVERLAPPING_ECAM_RANGE) {
+        return false;
+    }
+
+    /*
+     * Absence is the one outcome here that is not a fault. The signature is
+     * edited rather than the table removed, so the walk still visits it and
+     * still has to conclude that no MCFG is present.
+     */
+    prepare_test_fixture(&fixture);
+    root = test_root(&fixture, ACPI_ROOT_XSDT);
+    fixture.mcfg.header.signature[0] = 'N';
+    set_checksum(&fixture.mcfg, sizeof(fixture.mcfg));
+
+    if (acpi_mcfg_discover(&root, &mcfg) != ACPI_STATUS_MISSING_MCFG ||
+        mcfg.allocation_count != 0U) {
+        return false;
+    }
+
+    /* The same table twice, which cannot be resolved by position. */
+    prepare_test_fixture(&fixture);
+    root = test_root(&fixture, ACPI_ROOT_XSDT);
+
+    for (size_t index = 0; index < sizeof(fixture.other.header.signature);
+         ++index) {
+        fixture.other.header.signature[index] = mcfg_signature[index];
+    }
+
+    set_checksum(&fixture.other, sizeof(fixture.other));
+    return acpi_mcfg_discover(&root, &mcfg) == ACPI_STATUS_DUPLICATE_MCFG;
+}
+
 bool acpi_tables_self_test(void)
 {
     struct acpi_test_fixture fixture;
     struct acpi_madt madt;
     struct acpi_root root;
 
-    if (!valid_fixture_is_accepted() || !valid_fadt_is_accepted()) {
+    if (!valid_fixture_is_accepted() || !valid_fadt_is_accepted() ||
+        !valid_mcfg_is_accepted() || !mcfg_rejections_are_named()) {
         return false;
     }
 

@@ -33,6 +33,31 @@
 #define ACPI_PM_TIMER_EXTENDED_BITS UINT8_C(32)
 #define ACPI_PM_TIMER_REGISTER_BITS UINT8_C(32)
 
+/*
+ * PCI Firmware Specification 3.3 section 4.1.2 fixes the memory-mapped
+ * configuration table's layout: a description header, eight reserved bytes,
+ * then a whole number of sixteen-byte allocation structures.
+ */
+#define ACPI_MCFG_FIXED_SIZE 44U
+#define ACPI_MCFG_ALLOCATION_SIZE 16U
+
+/*
+ * PCI Express Base Specification 6.1 section 7.2.2 lays configuration space out
+ * so that the bus number occupies address bits 27:20, the device bits 19:15,
+ * the function bits 14:12 and the register the low twelve. One bus is therefore
+ * 1 MiB of memory and one function 4 KiB of it, and a base address that is not
+ * 1 MiB aligned cannot be indexed that way at all.
+ */
+#define ACPI_ECAM_BUS_SIZE UINT64_C(0x100000)
+#define ACPI_ECAM_FUNCTION_SIZE UINT64_C(0x1000)
+
+/*
+ * A Seneri early-boot policy bound on how many configuration windows firmware
+ * may declare, not an architectural one. Every machine Seneri is tested on
+ * declares one. It keeps the discovered description in fixed storage.
+ */
+#define ACPI_MAX_ECAM_ALLOCATIONS 8U
+
 enum acpi_root_kind {
     ACPI_ROOT_NONE = 0,
     ACPI_ROOT_RSDT,
@@ -85,7 +110,15 @@ enum acpi_status {
     ACPI_STATUS_BAD_PM_TIMER_LENGTH,
     ACPI_STATUS_MISSING_PM_TIMER,
     ACPI_STATUS_BAD_PM_TIMER_BLOCK,
-    ACPI_STATUS_BAD_PM_TIMER_PORT
+    ACPI_STATUS_BAD_PM_TIMER_PORT,
+    ACPI_STATUS_MISSING_MCFG,
+    ACPI_STATUS_DUPLICATE_MCFG,
+    ACPI_STATUS_BAD_MCFG_LENGTH,
+    ACPI_STATUS_NO_ECAM_ALLOCATIONS,
+    ACPI_STATUS_TOO_MANY_ECAM_ALLOCATIONS,
+    ACPI_STATUS_BAD_ECAM_BUS_RANGE,
+    ACPI_STATUS_BAD_ECAM_BASE,
+    ACPI_STATUS_OVERLAPPING_ECAM_RANGE
 };
 
 struct acpi_root {
@@ -122,6 +155,35 @@ struct acpi_fadt {
     bool pm_timer_extended_address;
     char oem_id[7];
     char oem_table_id[9];
+};
+
+/*
+ * One firmware-declared memory-mapped configuration window: where the enhanced
+ * configuration access mechanism starts, which PCI segment group it serves, and
+ * which buses of that group it covers. The window is described here and used by
+ * src/kernel/pci.c; this reader never touches the memory it names.
+ */
+struct acpi_ecam_allocation {
+    uint64_t base_address;
+    uint16_t segment;
+    uint8_t start_bus;
+    uint8_t end_bus;
+};
+
+/*
+ * The memory-mapped configuration table. Unlike the MADT and the FADT this
+ * table is optional: a machine with no PCI Express host bridge has no reason to
+ * publish one, and ACPI_STATUS_MISSING_MCFG is a description of such a machine
+ * rather than a fault in its firmware. The caller decides what absence means.
+ */
+struct acpi_mcfg {
+    uint64_t physical_address;
+    uint32_t length;
+    size_t allocation_count;
+    uint8_t revision;
+    char oem_id[7];
+    char oem_table_id[9];
+    struct acpi_ecam_allocation allocations[ACPI_MAX_ECAM_ALLOCATIONS];
 };
 
 /*
@@ -187,10 +249,20 @@ enum acpi_status acpi_fadt_discover(
     const struct acpi_root *root,
     struct acpi_fadt *fadt
 );
+enum acpi_status acpi_mcfg_discover(
+    const struct acpi_root *root,
+    struct acpi_mcfg *mcfg
+);
 enum acpi_status acpi_topology_discover(
     const struct acpi_madt *madt,
     struct acpi_topology *topology
 );
+
+/*
+ * How many bytes of memory an allocation's bus range occupies. Validated at
+ * discovery to be non-zero and to fit inside a 64-bit address space.
+ */
+uint64_t acpi_ecam_allocation_size(const struct acpi_ecam_allocation *allocation);
 bool acpi_self_test(void);
 bool acpi_tables_self_test(void);
 bool acpi_topology_self_test(void);
