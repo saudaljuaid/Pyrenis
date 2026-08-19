@@ -39,7 +39,7 @@ become false is worse than no entry, because it is read as current.
 
 Ordered by what it costs to leave alone, not by size.
 
-### 1. Integration debt — half paid
+### 1. Integration debt — measured, and smaller than it looked
 
 **The exit-value collision is resolved.** PR #31
 (`ioapic: route level-triggered sources with directed EOI`) was opened against
@@ -48,27 +48,78 @@ to `0x23`–`0x27` and `0x22` is reserved by name in both `test.c` and the
 `Makefile`. The two changes can now land in either order without one silently
 passing as the other.
 
-**What remains is textual.** Measured with
-`git merge-tree --write-tree --name-only`, this branch and PR #31 both touch
-five files — `Makefile`, `README.md`, `docs/PIT_RETIREMENT.md`,
-`src/kernel/kernel.c` and `src/kernel/test.c` — in the same regions: the
-scenario list, the boot sequence, and the deferred-work paragraph both changes
-rewrite. `include/seneri/test.h` merges cleanly.
+**The pile of unmerged branches is not a pile.** `git branch -r` shows eighteen
+branches and `git branch -r --no-merged origin/main` shows all eighteen, which
+reads as eighteen abandoned lines of work. It is not. Every pull request in this
+repository was squash-merged, and a squash merge leaves the original branch tip
+unreachable from `main` even though every line of it landed. The reachability
+question is the wrong one; the patch question is the right one:
+
+    git cherry origin/main <branch>     # '-' means already upstream, '+' means not
+
+Run across all eighteen, sixteen report every commit already upstream. Of the
+remaining two, `seneri-os-tsc-primitive-2gc90u` reports one commit not upstream
+purely because the patch context shifted — the symbol it adds, `cpu_read_tsc`,
+is present in `main` verbatim in `src/arch/x86_64/cpu.S` and declared in
+`include/seneri/cpu.h`. Checked by hand rather than trusted.
+
+**So exactly two branches carry work that is not in `main`:**
+
+| Branch | Pull request | State |
+| --- | --- | --- |
+| `seneri-os-ioapic-level-dapmyc` | #31 | open, one commit |
+| `seneri-os-pci-enumeration` | #32 | open, eight commits |
+
+The other sixteen are the remains of merged or superseded pull requests. Two of
+them — `claude/seneri-acpi-pm-timer-k69tgx` (#23) and `seneri-os-c-update-2gc90u`
+(#14) — belong to pull requests closed unmerged as duplicates, and their content
+reached `main` through #24 and #17 respectively. `git cherry` agrees.
+
+They cost nothing to keep except the false impression they create, which is the
+whole reason this entry exists. Deleting them is one command per branch and the
+commits stay recoverable from each pull request's page:
+
+    git push origin --delete <branch>
+
+That is a decision about someone else's repository, so it is written down here
+rather than done.
+
+**This census was broken before it was believed.** Patch identity is not proof,
+so the claim was re-checked a second way and then the checker itself was
+checked:
+
+| Control | Result |
+| --- | --- |
+| For all sixteen branches, does `main` contain every function symbol the branch adds to `src/` or `include/`? | Yes, every one. The claim survives a symbol-level check, not just a patch-ID one. |
+| Is #31's work genuinely absent from `main`, so the census is not vacuously true? | Absent. `acknowledgement_targets_are_resolved`, `directed_eoi_is_gated_on_version` and `entries_round_trip` exist on that branch and nowhere in `main`. |
+| Can the checker fail at all? | Yes. Fed `seneri_this_symbol_does_not_exist` it reports missing, so a clean run means something. |
+
+**What remains between #31 and #32 is textual.** Measured with
+`git merge-tree --write-tree --name-only`, the two branches touch the same five
+files — `Makefile`, `README.md`, `docs/PIT_RETIREMENT.md`, `src/kernel/kernel.c`
+and `src/kernel/test.c` — in the same regions: the scenario list, the boot
+sequence, and the deferred-work paragraph both changes rewrite.
+`include/seneri/test.h` merges cleanly.
 
 None of those are semantic disagreements any more, but they are hand
 resolutions, and there are more of them every increment that lands on either
-side. **This branch merges cleanly with `main` today.** The order that costs
-least is #31 first, then this.
+side. **Both branches merge cleanly with `main` today.** The order that costs
+least is #31 first, then #32.
 
 ### 2. `kernel.c` has become the place proofs go to live
 
     $ wc -l src/kernel/kernel.c
-    1990          # was 1256 at the start of this session
+    2211          # 1256 at the start of this session; 1990 when this file was written
 
 Every increment adds a `prove_X()` and every `prove_X()` lands here, so the file
 grows once per subsystem regardless of how well factored that subsystem is. It
 is now the third largest file in the kernel and the only one with no single
 responsibility.
+
+**This entry has already been proved right once.** It was written at 1,990
+lines, warning that each increment landing first makes the move bigger. The very
+next increment — preemption — added 221 more. That is the cost of deferring it,
+measured rather than predicted.
 
 The fix is not clever: boot proofs belong beside the subsystems they prove, or
 in a `src/kernel/boot_proofs.c` that `kernel_main` calls in order. Doing it is
@@ -117,11 +168,18 @@ test suite:
     pit_frequency, pit_is_running, pm_timer_nanoseconds_to_ticks,
     timer_stop, timer_is_started, timer_arm, ...
 
-Much of it is deliberate observability, which is fine. But **`timer_arm` is the
-deadline layer's primary entry point and nothing in the kernel calls it** — the
-only production user of that subsystem is `timer_sleep_ns`. That is worth
-knowing before building preemption on top of it: the API is less exercised than
-its test count suggests.
+Much of it is deliberate observability, which is fine. But **`timer_arm` was the
+deadline layer's primary entry point with nothing in the kernel calling it** —
+the only production user of that subsystem was `timer_sleep_ns`. That was worth
+knowing before building preemption on top of it, because the API was less
+exercised than its test count suggested.
+
+**Resolved, and the warning was earned.** `thread.c` now arms the quantum
+through `timer_arm`, so the path has a production caller. The first run of that
+caller hung the machine — not because `timer_arm` was wrong, but because the
+threads it was arming for started with interrupts disabled. An entry point that
+only tests had used met its first real caller and the first real caller had a
+bug. That is the shape this entry predicted.
 
 ### 6. No host-side Rust test target
 
@@ -165,5 +223,16 @@ Measured, and healthy:
     grep -rn 'TODO\|FIXME\|XXX\|HACK' src/ include/ docs/ Makefile
     nm -u build/seneri.elf
     git log --oneline origin/main..HEAD | wc -l
+
+And, for §1 — which branch still holds work that `main` does not:
+
+    for b in $(git branch -r --no-merged origin/main | grep -v HEAD); do
+        printf '%-48s %s\n' "$b" "$(git cherry origin/main "$b" | grep -c '^+') unlanded"
+    done
+
+Read that output with the squash-merge caveat in mind: a `+` means the patch
+identity differs, which is *evidence* of unlanded work and not proof of it.
+Shifted context produces a `+` for a change that landed. Confirm by looking for
+the symbol the commit adds before concluding a branch matters.
 
 This file is worth exactly as much as the last time somebody ran those.
