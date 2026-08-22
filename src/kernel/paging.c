@@ -176,12 +176,20 @@ struct process_space_runtime {
     bool owned;
 };
 
-struct process_alias_runtime {
-    uint64_t generation;
+struct process_alias_page_runtime {
     uint64_t physical_address;
     uint64_t saved_entry;
     uint64_t split_table;
+    uint64_t private_saved_entry;
+    uint64_t private_split_table;
     bool split;
+    bool private_split;
+};
+
+struct process_alias_runtime {
+    uint64_t generation;
+    struct process_alias_page_runtime pages[PAGING_PROCESS_ALIAS_MAX_PAGES];
+    size_t count;
     bool owned;
 };
 
@@ -1935,6 +1943,16 @@ static void zero_process_alias(struct paging_process_image_alias *alias)
     alias->active = false;
 }
 
+static void zero_process_alias_set(struct paging_process_alias_set *alias)
+{
+    for (size_t index = 0U; index < PAGING_PROCESS_ALIAS_MAX_PAGES; ++index) {
+        alias->physical_addresses[index] = 0U;
+    }
+    alias->generation = 0U;
+    alias->count = 0U;
+    alias->active = false;
+}
+
 static bool process_space_matches(const struct paging_process_space *space)
 {
     return space != NULL && process_space_runtime.owned &&
@@ -2020,7 +2038,65 @@ static bool process_mapping_request_valid(
             (virtual_address & (PAGING_PAGE_SIZE - 1U)) == 0U &&
             permissions == PAGING_WRITE;
     }
+    if (kind == PAGING_PROCESS_MAPPING_LINUX_IMAGE) {
+        if (virtual_address < PAGING_LINUX_IMAGE_BASE ||
+            virtual_address >= PAGING_LINUX_IMAGE_END ||
+            (virtual_address & (PAGING_PAGE_SIZE - 1U)) != 0U) {
+            return false;
+        }
+        const size_t page = (size_t)((virtual_address -
+            PAGING_LINUX_IMAGE_BASE) / PAGING_PAGE_SIZE);
+
+        if (page == 0U || page == 7U) {
+            return permissions == PAGING_READ;
+        }
+        if (page >= 1U && page <= 6U) {
+            return permissions == PAGING_EXECUTE;
+        }
+        return page == 8U && permissions == PAGING_WRITE;
+    }
+    if (kind == PAGING_PROCESS_MAPPING_LINUX_STACK) {
+        return virtual_address >= PAGING_LINUX_STACK_BASE &&
+            virtual_address < PAGING_LINUX_STACK_END &&
+            (virtual_address & (PAGING_PAGE_SIZE - 1U)) == 0U &&
+            permissions == PAGING_WRITE;
+    }
+    if (kind == PAGING_PROCESS_MAPPING_LINUX_HEAP) {
+        return virtual_address >= PAGING_LINUX_HEAP_BASE &&
+            virtual_address < PAGING_LINUX_HEAP_BASE +
+                PAGING_LINUX_HEAP_PAGES * PAGING_PAGE_SIZE &&
+            (virtual_address & (PAGING_PAGE_SIZE - 1U)) == 0U &&
+            permissions == PAGING_WRITE;
+    }
+    if (kind == PAGING_PROCESS_MAPPING_LINUX_ANON) {
+        return virtual_address == PAGING_LINUX_ANON_ADDRESS &&
+            permissions == PAGING_WRITE;
+    }
     return false;
+}
+
+static bool process_alias_contains(uint64_t physical_address)
+{
+    if (!process_alias_runtime.owned) {
+        return false;
+    }
+    for (size_t index = 0U; index < process_alias_runtime.count; ++index) {
+        if (process_alias_runtime.pages[index].physical_address ==
+                physical_address) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool process_unmap_request_valid(
+    enum paging_process_mapping_kind kind,
+    uint64_t virtual_address
+)
+{
+    return process_mapping_request_valid(kind, virtual_address, PAGING_READ) ||
+        process_mapping_request_valid(kind, virtual_address, PAGING_WRITE) ||
+        process_mapping_request_valid(kind, virtual_address, PAGING_EXECUTE);
 }
 
 static bool no_user_bits_in_table(uint64_t table, unsigned int level)
@@ -2234,67 +2310,169 @@ enum paging_status paging_process_space_build(
     return PAGING_STATUS_OK;
 }
 
+static enum paging_status restore_alias_page(
+    struct process_alias_page_runtime *page,
+    bool private_hierarchy
+)
+{
+    if (private_hierarchy) {
+        if (page->private_saved_entry == 0U) {
+            return PAGING_STATUS_OK;
+        }
+        return restore_identity_alias(&process_space_runtime.hierarchy,
+            page->physical_address, page->private_saved_entry,
+            page->private_split_table, page->private_split);
+    }
+    if (page->saved_entry == 0U) {
+        return PAGING_STATUS_OK;
+    }
+    return restore_identity_alias(&live_hierarchy, page->physical_address,
+        page->saved_entry, page->split_table, page->split);
+}
+
+static enum paging_status rollback_alias_pages(size_t count)
+{
+    enum paging_status result = PAGING_STATUS_OK;
+
+    for (size_t remaining = count; remaining > 0U; --remaining) {
+        if (restore_alias_page(&process_alias_runtime.pages[remaining - 1U],
+                true) != PAGING_STATUS_OK) {
+            result = PAGING_STATUS_PROCESS_ALIAS_STATE;
+        }
+    }
+    for (size_t remaining = count; remaining > 0U; --remaining) {
+        if (restore_alias_page(&process_alias_runtime.pages[remaining - 1U],
+                false) != PAGING_STATUS_OK) {
+            result = PAGING_STATUS_PROCESS_ALIAS_STATE;
+        }
+    }
+    state.table_frames = live_hierarchy.table_frames;
+    return result;
+}
+
+static enum paging_status narrow_alias_pages(
+    const struct paging_process_space *space,
+    const uint64_t *physical_addresses,
+    size_t count
+)
+{
+    enum paging_status status;
+
+    if (!process_space_matches(space)) {
+        return PAGING_STATUS_PROCESS_BAD_TOKEN;
+    }
+    if (physical_addresses == NULL || count == 0U ||
+        count > PAGING_PROCESS_ALIAS_MAX_PAGES) {
+        return PAGING_STATUS_PROCESS_ALIAS_STATE;
+    }
+    if (process_space_runtime.state != PAGING_PROCESS_SPACE_BUILDING ||
+        process_alias_runtime.owned || cpu_interrupts_enabled() ||
+        (cpu_read_cr3() & PAGE_FRAME_MASK) != live_hierarchy.root) {
+        return PAGING_STATUS_PROCESS_ALIAS_STATE;
+    }
+    process_alias_runtime.count = 0U;
+    for (size_t index = 0U; index < count; ++index) {
+        const uint64_t physical_address = physical_addresses[index];
+
+        if ((physical_address & (PAGING_PAGE_SIZE - 1U)) != 0U ||
+            !frame_range_overlaps_allocatable_memory(physical_address,
+                PAGING_PAGE_SIZE)) {
+            return PAGING_STATUS_PROCESS_ALIAS_STATE;
+        }
+        for (size_t prior = 0U; prior < index; ++prior) {
+            if (physical_addresses[prior] == physical_address) {
+                return PAGING_STATUS_PROCESS_ALIAS_STATE;
+            }
+        }
+    }
+    for (size_t index = 0U; index < count; ++index) {
+        struct process_alias_page_runtime *page =
+            &process_alias_runtime.pages[index];
+
+        page->physical_address = physical_addresses[index];
+        page->saved_entry = 0U;
+        page->split_table = 0U;
+        page->private_saved_entry = 0U;
+        page->private_split_table = 0U;
+        page->split = false;
+        page->private_split = false;
+        status = narrow_identity_alias(&live_hierarchy,
+            page->physical_address, &page->saved_entry, &page->split_table,
+            &page->split);
+        if (status != PAGING_STATUS_OK) {
+            (void)restore_alias_page(page, false);
+            if (rollback_alias_pages(index) != PAGING_STATUS_OK) {
+                return PAGING_STATUS_PROCESS_ALIAS_STATE;
+            }
+            return status;
+        }
+        state.table_frames = live_hierarchy.table_frames;
+        status = narrow_identity_alias(&process_space_runtime.hierarchy,
+            page->physical_address, &page->private_saved_entry,
+            &page->private_split_table, &page->private_split);
+        if (status != PAGING_STATUS_OK) {
+            (void)restore_alias_page(page, true);
+            (void)restore_alias_page(page, false);
+            if (rollback_alias_pages(index) != PAGING_STATUS_OK) {
+                return PAGING_STATUS_PROCESS_ALIAS_STATE;
+            }
+            state.table_frames = live_hierarchy.table_frames;
+            return status;
+        }
+        process_alias_runtime.count = index + 1U;
+    }
+    process_alias_runtime.generation = next_alias_generation++;
+    if (next_alias_generation == 0U) {
+        next_alias_generation = 1U;
+    }
+    process_alias_runtime.owned = true;
+    return PAGING_STATUS_OK;
+}
+
 enum paging_status paging_process_image_alias_narrow(
     const struct paging_process_space *space,
     uint64_t physical_address,
     struct paging_process_image_alias *alias
 )
 {
-    uint64_t private_saved = 0U;
-    uint64_t private_split_table = 0U;
-    bool private_split = false;
     enum paging_status status;
-    enum paging_status rollback_status;
 
     if (alias == NULL) {
         return PAGING_STATUS_NULL_ARGUMENT;
     }
     zero_process_alias(alias);
-    if (!process_space_matches(space)) {
-        return PAGING_STATUS_PROCESS_BAD_TOKEN;
-    }
-    if (process_space_runtime.state != PAGING_PROCESS_SPACE_BUILDING ||
-        process_alias_runtime.owned || cpu_interrupts_enabled() ||
-        (cpu_read_cr3() & PAGE_FRAME_MASK) != live_hierarchy.root ||
-        (physical_address & (PAGING_PAGE_SIZE - 1U)) != 0U ||
-        !frame_range_overlaps_allocatable_memory(physical_address,
-            PAGING_PAGE_SIZE)) {
-        return PAGING_STATUS_PROCESS_ALIAS_STATE;
-    }
-    status = narrow_identity_alias(&live_hierarchy, physical_address,
-        &process_alias_runtime.saved_entry,
-        &process_alias_runtime.split_table, &process_alias_runtime.split);
+    status = narrow_alias_pages(space, &physical_address, 1U);
     if (status != PAGING_STATUS_OK) {
-        rollback_status = PAGING_STATUS_OK;
-        if (process_alias_runtime.saved_entry != 0U) {
-            rollback_status = restore_identity_alias(&live_hierarchy,
-                physical_address, process_alias_runtime.saved_entry,
-                process_alias_runtime.split_table,
-                process_alias_runtime.split);
-        }
-        state.table_frames = live_hierarchy.table_frames;
-        return rollback_status == PAGING_STATUS_OK ? status : rollback_status;
+        return status;
     }
-    state.table_frames = live_hierarchy.table_frames;
-    status = narrow_identity_alias(&process_space_runtime.hierarchy,
-        physical_address, &private_saved, &private_split_table,
-        &private_split);
-    if (status != PAGING_STATUS_OK) {
-        rollback_status = restore_identity_alias(&live_hierarchy,
-            physical_address,
-            process_alias_runtime.saved_entry,
-            process_alias_runtime.split_table, process_alias_runtime.split);
-        state.table_frames = live_hierarchy.table_frames;
-        return rollback_status == PAGING_STATUS_OK ? status : rollback_status;
-    }
-    process_alias_runtime.generation = next_alias_generation++;
-    if (next_alias_generation == 0U) {
-        next_alias_generation = 1U;
-    }
-    process_alias_runtime.physical_address = physical_address;
-    process_alias_runtime.owned = true;
     alias->physical_address = physical_address;
     alias->generation = process_alias_runtime.generation;
+    alias->active = true;
+    return PAGING_STATUS_OK;
+}
+
+enum paging_status paging_process_alias_set_narrow(
+    const struct paging_process_space *space,
+    const uint64_t *physical_addresses,
+    size_t count,
+    struct paging_process_alias_set *alias
+)
+{
+    enum paging_status status;
+
+    if (alias == NULL) {
+        return PAGING_STATUS_NULL_ARGUMENT;
+    }
+    zero_process_alias_set(alias);
+    status = narrow_alias_pages(space, physical_addresses, count);
+    if (status != PAGING_STATUS_OK) {
+        return status;
+    }
+    for (size_t index = 0U; index < count; ++index) {
+        alias->physical_addresses[index] = physical_addresses[index];
+    }
+    alias->generation = process_alias_runtime.generation;
+    alias->count = count;
     alias->active = true;
     return PAGING_STATUS_OK;
 }
@@ -2309,32 +2487,37 @@ enum paging_status paging_process_map_user_page(
 {
     struct paging_translation supervisor;
     uint64_t *entry = NULL;
+    const bool executable = (permissions & PAGING_EXECUTE) != 0U;
+    const bool runtime_mapping =
+        kind == PAGING_PROCESS_MAPPING_LINUX_HEAP ||
+        kind == PAGING_PROCESS_MAPPING_LINUX_ANON;
     enum paging_status status;
 
     if (!process_space_matches(space)) {
         return PAGING_STATUS_PROCESS_BAD_TOKEN;
     }
-    if (process_space_runtime.state != PAGING_PROCESS_SPACE_BUILDING ||
+    if ((!runtime_mapping && process_space_runtime.state !=
+            PAGING_PROCESS_SPACE_BUILDING) ||
+        (runtime_mapping && process_space_runtime.state !=
+            PAGING_PROCESS_SPACE_BUILDING &&
+            process_space_runtime.state != PAGING_PROCESS_SPACE_INSTALLED &&
+            process_space_runtime.state != PAGING_PROCESS_SPACE_ACTIVE) ||
         !process_mapping_request_valid(kind, virtual_address, permissions) ||
         (physical_address & (PAGING_PAGE_SIZE - 1U)) != 0U ||
         !frame_range_overlaps_allocatable_memory(physical_address,
             PAGING_PAGE_SIZE)) {
         return PAGING_STATUS_PROCESS_BAD_MAPPING;
     }
-    if (kind == PAGING_PROCESS_MAPPING_IMAGE &&
-        (!process_alias_runtime.owned ||
-            process_alias_runtime.physical_address != physical_address)) {
+    if (executable && !process_alias_contains(physical_address)) {
         return PAGING_STATUS_PROCESS_ALIAS_STATE;
     }
-    status = translate_address(&live_hierarchy, physical_address, &supervisor,
-        state.pat_after);
+    status = translate_address(&process_space_runtime.hierarchy,
+        physical_address, &supervisor, state.pat_after);
     if (status != PAGING_STATUS_OK || supervisor.user ||
         supervisor.physical_address != physical_address ||
         supervisor.memory_type != PAGING_MEMORY_WRITE_BACK ||
-        (kind == PAGING_PROCESS_MAPPING_IMAGE &&
-            supervisor.permissions != PAGING_READ) ||
-        (kind == PAGING_PROCESS_MAPPING_STACK &&
-            supervisor.permissions != PAGING_WRITE)) {
+        (executable && supervisor.permissions != PAGING_READ) ||
+        (!executable && supervisor.permissions != PAGING_WRITE)) {
         return PAGING_STATUS_PROCESS_BAD_MAPPING;
     }
     status = entry_for_user(&process_space_runtime.hierarchy, virtual_address,
@@ -2347,6 +2530,7 @@ enum paging_status paging_process_map_user_page(
         return PAGING_STATUS_ALREADY_MAPPED;
     }
     *entry = physical_address | permissions_to_flags(permissions) | PAGE_USER;
+    invalidate(&process_space_runtime.hierarchy, virtual_address);
     sync_process_space(space);
     return PAGING_STATUS_OK;
 }
@@ -2358,15 +2542,17 @@ enum paging_status paging_process_unmap_user_page(
 )
 {
     uint64_t *entry = NULL;
+    const bool runtime_mapping =
+        kind == PAGING_PROCESS_MAPPING_LINUX_HEAP ||
+        kind == PAGING_PROCESS_MAPPING_LINUX_ANON;
     enum paging_status status;
 
     if (!process_space_matches(space)) {
         return PAGING_STATUS_PROCESS_BAD_TOKEN;
     }
-    if (process_space_runtime.state == PAGING_PROCESS_SPACE_ACTIVE ||
-        !process_mapping_request_valid(kind, virtual_address,
-            kind == PAGING_PROCESS_MAPPING_IMAGE ? PAGING_EXECUTE :
-                PAGING_WRITE)) {
+    if ((!runtime_mapping && process_space_runtime.state ==
+            PAGING_PROCESS_SPACE_ACTIVE) ||
+        !process_unmap_request_valid(kind, virtual_address)) {
         return PAGING_STATUS_PROCESS_BAD_STATE;
     }
     status = entry_for(&process_space_runtime.hierarchy, virtual_address, 1U,
@@ -2376,6 +2562,7 @@ enum paging_status paging_process_unmap_user_page(
         return PAGING_STATUS_NOT_MAPPED;
     }
     *entry = 0U;
+    invalidate(&process_space_runtime.hierarchy, virtual_address);
     reclaim_empty_tables(&process_space_runtime.hierarchy, virtual_address);
     sync_process_space(space);
     return PAGING_STATUS_OK;
@@ -2419,7 +2606,9 @@ enum paging_status paging_process_validate(
     }
     if (process_space_runtime.state != PAGING_PROCESS_SPACE_BUILDING ||
         !process_alias_runtime.owned ||
-        process_alias_runtime.physical_address != image_physical_address ||
+        process_alias_runtime.count != 1U ||
+        process_alias_runtime.pages[0].physical_address !=
+            image_physical_address ||
         !no_user_bits_in_kernel_branch(&process_space_runtime.hierarchy)) {
         return PAGING_STATUS_PROCESS_BAD_STATE;
     }
@@ -2470,6 +2659,94 @@ enum paging_status paging_process_validate(
     return PAGING_STATUS_OK;
 }
 
+enum paging_status paging_process_validate_linux(
+    struct paging_process_space *space,
+    const struct paging_process_expected_page *pages,
+    size_t page_count
+)
+{
+    struct paging_translation translation;
+    struct paging_audit audit;
+    size_t executable_pages = 0U;
+
+    if (pages == NULL) {
+        return PAGING_STATUS_NULL_ARGUMENT;
+    }
+    if (!process_space_matches(space)) {
+        return PAGING_STATUS_PROCESS_BAD_TOKEN;
+    }
+    if (process_space_runtime.state != PAGING_PROCESS_SPACE_BUILDING ||
+        !process_alias_runtime.owned || page_count == 0U ||
+        page_count > PAGING_PROCESS_EXPECTED_MAX_PAGES ||
+        !no_user_bits_in_kernel_branch(&process_space_runtime.hierarchy)) {
+        return PAGING_STATUS_PROCESS_BAD_STATE;
+    }
+    if (translate_address(&process_space_runtime.hierarchy, 0U, &translation,
+            state.pat_after) != PAGING_STATUS_NOT_MAPPED ||
+        translate_address(&process_space_runtime.hierarchy,
+            PAGING_LINUX_STACK_GUARD, &translation, state.pat_after) !=
+            PAGING_STATUS_NOT_MAPPED ||
+        translate_address(&process_space_runtime.hierarchy,
+            PAGING_LINUX_HEAP_BASE, &translation, state.pat_after) !=
+            PAGING_STATUS_NOT_MAPPED ||
+        translate_address(&process_space_runtime.hierarchy,
+            PAGING_LINUX_ANON_ADDRESS, &translation, state.pat_after) !=
+            PAGING_STATUS_NOT_MAPPED) {
+        return PAGING_STATUS_VALIDATION_FAILURE;
+    }
+    for (size_t index = 0U; index < page_count; ++index) {
+        const struct paging_process_expected_page *expected = &pages[index];
+        const bool image = process_mapping_request_valid(
+            PAGING_PROCESS_MAPPING_LINUX_IMAGE, expected->virtual_address,
+            expected->permissions);
+        const bool stack = process_mapping_request_valid(
+            PAGING_PROCESS_MAPPING_LINUX_STACK, expected->virtual_address,
+            expected->permissions);
+
+        if ((!image && !stack) ||
+            translate_address(&process_space_runtime.hierarchy,
+                expected->virtual_address, &translation, state.pat_after) !=
+                PAGING_STATUS_OK || !translation.user ||
+            translation.permissions != expected->permissions ||
+            translation.level != 1U ||
+            translation.physical_address != expected->physical_address ||
+            translation.memory_type != PAGING_MEMORY_WRITE_BACK) {
+            return PAGING_STATUS_VALIDATION_FAILURE;
+        }
+        for (size_t prior = 0U; prior < index; ++prior) {
+            if (pages[prior].virtual_address == expected->virtual_address ||
+                pages[prior].physical_address == expected->physical_address) {
+                return PAGING_STATUS_VALIDATION_FAILURE;
+            }
+        }
+        if ((expected->permissions & PAGING_EXECUTE) != 0U) {
+            ++executable_pages;
+            if (!process_alias_contains(expected->physical_address) ||
+                translate_address(&process_space_runtime.hierarchy,
+                    expected->physical_address, &translation,
+                    state.pat_after) != PAGING_STATUS_OK ||
+                translation.user || translation.permissions != PAGING_READ ||
+                translation.physical_address != expected->physical_address) {
+                return PAGING_STATUS_VALIDATION_FAILURE;
+            }
+        }
+    }
+    audit_hierarchy(&process_space_runtime.hierarchy, &audit);
+    if (executable_pages != process_alias_runtime.count ||
+        audit.write_execute_leaves != 0U ||
+        audit.user_leaves != page_count ||
+        (table_at(process_space_runtime.hierarchy.root)[0] & PAGE_USER) != 0U ||
+        (table_at(process_space_runtime.hierarchy.root)
+            [table_index(PAGING_LINUX_IMAGE_BASE, 4U)] & PAGE_USER) == 0U ||
+        (table_at(process_space_runtime.hierarchy.root)
+            [table_index(PAGING_LINUX_STACK_BASE, 4U)] & PAGE_USER) == 0U) {
+        return PAGING_STATUS_VALIDATION_FAILURE;
+    }
+    process_space_runtime.state = PAGING_PROCESS_SPACE_INSTALLED;
+    sync_process_space(space);
+    return PAGING_STATUS_OK;
+}
+
 enum paging_status paging_process_activate(struct paging_process_space *space)
 {
     if (!process_space_matches(space)) {
@@ -2513,41 +2790,87 @@ enum paging_status paging_process_restore_kernel(
     return PAGING_STATUS_OK;
 }
 
+static enum paging_status restore_active_aliases(
+    const struct paging_process_space *space
+)
+{
+    struct paging_audit audit;
+
+    if (!process_space_matches(space) || !process_alias_runtime.owned) {
+        return PAGING_STATUS_PROCESS_BAD_TOKEN;
+    }
+    audit_hierarchy(&process_space_runtime.hierarchy, &audit);
+    if (process_space_runtime.state == PAGING_PROCESS_SPACE_ACTIVE ||
+        cpu_interrupts_enabled() || audit.user_leaves != 0U ||
+        (cpu_read_cr3() & PAGE_FRAME_MASK) != live_hierarchy.root) {
+        return PAGING_STATUS_PROCESS_ALIAS_STATE;
+    }
+    for (size_t remaining = process_alias_runtime.count;
+         remaining > 0U; --remaining) {
+        if (restore_alias_page(
+                &process_alias_runtime.pages[remaining - 1U], false) !=
+                PAGING_STATUS_OK) {
+            state.table_frames = live_hierarchy.table_frames;
+            return PAGING_STATUS_PROCESS_ALIAS_STATE;
+        }
+    }
+    state.table_frames = live_hierarchy.table_frames;
+    process_alias_runtime.count = 0U;
+    process_alias_runtime.owned = false;
+    return PAGING_STATUS_OK;
+}
+
 enum paging_status paging_process_image_alias_restore(
     const struct paging_process_space *space,
     struct paging_process_image_alias *alias
 )
 {
-    struct paging_translation translation;
     enum paging_status status;
 
     if (alias == NULL) {
         return PAGING_STATUS_NULL_ARGUMENT;
     }
-    if (!process_space_matches(space) || !alias->active ||
-        !process_alias_runtime.owned ||
+    if (!alias->active || !process_alias_runtime.owned ||
+        process_alias_runtime.count != 1U ||
         alias->generation != process_alias_runtime.generation ||
-        alias->physical_address != process_alias_runtime.physical_address) {
+        alias->physical_address !=
+            process_alias_runtime.pages[0].physical_address) {
         return PAGING_STATUS_PROCESS_BAD_TOKEN;
     }
-    if (process_space_runtime.state == PAGING_PROCESS_SPACE_ACTIVE ||
-        cpu_interrupts_enabled() ||
-        (cpu_read_cr3() & PAGE_FRAME_MASK) != live_hierarchy.root ||
-        translate_address(&process_space_runtime.hierarchy,
-            PAGING_PROCESS_IMAGE_ADDRESS, &translation, state.pat_after) !=
-            PAGING_STATUS_NOT_MAPPED) {
-        return PAGING_STATUS_PROCESS_ALIAS_STATE;
-    }
-    status = restore_identity_alias(&live_hierarchy,
-        process_alias_runtime.physical_address,
-        process_alias_runtime.saved_entry, process_alias_runtime.split_table,
-        process_alias_runtime.split);
-    state.table_frames = live_hierarchy.table_frames;
+    status = restore_active_aliases(space);
     if (status != PAGING_STATUS_OK) {
         return status;
     }
-    process_alias_runtime.owned = false;
     zero_process_alias(alias);
+    return PAGING_STATUS_OK;
+}
+
+enum paging_status paging_process_alias_set_restore(
+    const struct paging_process_space *space,
+    struct paging_process_alias_set *alias
+)
+{
+    enum paging_status status;
+
+    if (alias == NULL) {
+        return PAGING_STATUS_NULL_ARGUMENT;
+    }
+    if (!alias->active || !process_alias_runtime.owned ||
+        alias->generation != process_alias_runtime.generation ||
+        alias->count != process_alias_runtime.count) {
+        return PAGING_STATUS_PROCESS_BAD_TOKEN;
+    }
+    for (size_t index = 0U; index < alias->count; ++index) {
+        if (alias->physical_addresses[index] !=
+                process_alias_runtime.pages[index].physical_address) {
+            return PAGING_STATUS_PROCESS_BAD_TOKEN;
+        }
+    }
+    status = restore_active_aliases(space);
+    if (status != PAGING_STATUS_OK) {
+        return status;
+    }
+    zero_process_alias_set(alias);
     return PAGING_STATUS_OK;
 }
 

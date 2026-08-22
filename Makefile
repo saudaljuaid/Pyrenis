@@ -10,10 +10,11 @@ TEST_SCENARIOS := normal breakpoint invalid-opcode page-fault ist pit unexpected
 	double-fault apic ioapic ioapic-level retired apic-timer tsc pm-timer \
 	pit-retired timers paging heap pci pci-ecam threads thread-guard framebuffer \
 	screen keyboard shell surface write-combining device-windows \
-	boot-ledger first-light device-substrate xhci nvme filesystem process
+	boot-ledger first-light device-substrate xhci nvme filesystem process \
+	linux-abi
 TEST_TARGETS := $(addprefix qemu-test-,$(TEST_SCENARIOS))
-EXPECTED_TEST_SCENARIO_COUNT := 37
-EXPECTED_SHELL_ASSERTION_COUNT := 231
+EXPECTED_TEST_SCENARIO_COUNT := 38
+EXPECTED_SHELL_ASSERTION_COUNT := 251
 
 CC := gcc
 LD := ld
@@ -28,6 +29,8 @@ QEMU_ACCEL ?= tcg
 RUST_TARGET := x86_64-unknown-none
 RUST_LIB := $(BUILD_DIR)/libsapote.a
 RUST_FAT16_TEST := $(BUILD_DIR)/fat16-tests
+RUST_LINUX_FAT16_TEST := $(BUILD_DIR)/linux-fat16-tests
+RUST_LINUX_ELF64_TEST := $(BUILD_DIR)/linux-elf64-tests
 RUST_ELF64_TEST := $(BUILD_DIR)/elf64-tests
 RUST_SOURCES := $(wildcard src/rust/*.rs)
 LOGO_SOURCE := assets/sapote-logo.png
@@ -46,6 +49,10 @@ NVME_FIXTURE := $(TEST_BUILD_DIR)/nvme/nvme-fixture.raw
 FILESYSTEM_FIXTURE := $(TEST_BUILD_DIR)/filesystem/fat16-fixture.raw
 PROCESS_ELF := $(TEST_BUILD_DIR)/process/SAPOTE.BIN
 PROCESS_FIXTURE := $(TEST_BUILD_DIR)/process/process-fixture.raw
+BUSYBOX_OUTPUT_DIR := $(BUILD_DIR)/busybox-contract
+BUSYBOX_WORK_DIR := $(BUILD_DIR)/busybox-work
+BUSYBOX_BINARY := $(BUSYBOX_OUTPUT_DIR)/busybox
+LINUX_ABI_FIXTURE := $(BUILD_DIR)/fixtures/linux-abi-fat16.raw
 
 CPPFLAGS := -Iinclude
 COMMON_FLAGS := -m64 -g -ffreestanding -fno-pie -fno-stack-protector
@@ -70,10 +77,14 @@ OBJECTS := $(ASM_OBJECTS) $(C_OBJECTS)
 
 # Warnings are errors on both sides of the language boundary, and Rust is held
 # to the stricter rule that an unsafe operation inside an unsafe function still
-# needs its own unsafe block naming why it is sound.
+# needs its own unsafe block naming why it is sound. The measured 5,136-byte
+# FAT chain is the largest Rust aggregate; allowing 1,024 direct stores keeps
+# its bounded copies and zeroing inline instead of introducing a GOT-backed
+# compiler memory call into the fixed-address kernel.
 RUSTFLAGS := --edition 2024 --target $(RUST_TARGET) --crate-type staticlib \
 	--crate-name sapote -C panic=abort -C opt-level=2 \
-	-C relocation-model=static -D warnings
+	-C relocation-model=static -C llvm-args=-max-store-memcpy=1024 \
+	-C llvm-args=-max-store-memset=1024 -D warnings
 DEPENDENCIES := $(C_OBJECTS:.o=.d)
 
 # The qemu-test-% scenarios are deliberately absent from .PHONY. GNU Make skips
@@ -123,11 +134,36 @@ $(RUST_LIB): $(RUST_SOURCES) $(LOGO_BLOB) $(FONT_BLOB) $(UI_FONT_BLOB) | $(BUILD
 	SAPOTE_UI_FONT_BLOB='$(CURDIR)/$(UI_FONT_BLOB)' \
 		$(RUSTC) $(RUSTFLAGS) -o $@ src/rust/lib.rs
 
+$(BUSYBOX_BINARY): tools/build-busybox-proof.sh \
+		userspace/busybox/busybox.config \
+		userspace/busybox/source/busybox-1.38.0.tar.bz2 \
+		userspace/busybox/source/musl-1.2.6.tar.gz
+	SAPOTE_BUSYBOX_BUILD_ONLY=1 bash tools/build-busybox-proof.sh \
+		$(BUSYBOX_OUTPUT_DIR) $(BUSYBOX_WORK_DIR)
+
+$(LINUX_ABI_FIXTURE): $(BUSYBOX_BINARY) tools/make-linux-abi-fixture.py
+	mkdir -p $(dir $@)
+	$(PYTHON) tools/make-linux-abi-fixture.py $(BUSYBOX_BINARY) $@
+
 $(KERNEL): $(OBJECTS) $(RUST_LIB) linker.ld
-	$(LD) $(LDFLAGS) -o $@ $(OBJECTS) $(RUST_LIB)
+	$(LD) $(LDFLAGS) -o $@ $(OBJECTS) $(RUST_LIB) || { \
+		sed -n '/__got_start/,/__got_end/p' $(BUILD_DIR)/sapote.map; \
+		sed 's/ASSERT(__got_end == __got_start,/ASSERT(1,/' \
+			linker.ld >$(BUILD_DIR)/linker-got-diagnostic.ld; \
+		$(LD) -nostdlib -z max-page-size=0x1000 -z noexecstack \
+			--orphan-handling=error --build-id=none --emit-relocs \
+			-T $(BUILD_DIR)/linker-got-diagnostic.ld \
+			-o $(BUILD_DIR)/sapote-got-diagnostic.elf \
+			$(OBJECTS) $(RUST_LIB) || true; \
+		readelf -W -r $(BUILD_DIR)/sapote-got-diagnostic.elf \
+			| grep 'GOT' || true; \
+		$(OBJDUMP) -dr $(RUST_LIB) \
+			| grep -B 8 -A 2 'R_X86_64_GOTPCREL' || true; \
+		exit 1; \
+	}
 
 toolchain:
-	@for tool in gcc ld grub-file readelf nm objdump rustc python3 sha256sum strings; do \
+	@for tool in bash bzip2 gcc gzip ld grub-file readelf nm objdump rustc python3 sha256sum strings tar; do \
 		command -v $$tool >/dev/null 2>&1 || { echo "missing tool: $$tool"; exit 1; }; \
 	done
 	@version=$$($(RUSTC) --version | awk '{ print $$2 }'); \
@@ -171,6 +207,14 @@ verify: toolchain lint
 	$(RUSTC) --edition 2024 --test -D warnings src/rust/fat16.rs \
 		-o $(RUST_FAT16_TEST)
 	$(RUST_FAT16_TEST)
+	$(RUSTC) --edition 2024 --test -D warnings \
+		tools/linux-fat16-host-test.rs -o $(RUST_LINUX_FAT16_TEST)
+	$(RUST_LINUX_FAT16_TEST)
+	$(MAKE) $(LINUX_ABI_FIXTURE)
+	SAPOTE_BUSYBOX_BINARY='$(CURDIR)/$(BUSYBOX_BINARY)' \
+		$(RUSTC) --edition 2024 --test -D warnings \
+		tools/linux-elf64-host-test.rs -o $(RUST_LINUX_ELF64_TEST)
+	$(RUST_LINUX_ELF64_TEST)
 	$(RUSTC) --edition 2024 --test -D warnings src/rust/elf64.rs \
 		-o $(RUST_ELF64_TEST)
 	$(RUST_ELF64_TEST)
@@ -218,6 +262,11 @@ verify: toolchain lint
 	@$(NM) $(KERNEL) | grep -Eq ' T sapote_fat16_parse_fat$$'
 	@$(NM) $(KERNEL) | grep -Eq ' T sapote_fat16_validate_extent$$'
 	@$(NM) $(KERNEL) | grep -Eq ' T sapote_fat16_validate_payload$$'
+	@$(NM) $(KERNEL) | grep -Eq ' T sapote_linux_fat16_find_root$$'
+	@$(NM) $(KERNEL) | grep -Eq ' T sapote_linux_fat16_build_chain$$'
+	@$(NM) $(KERNEL) | grep -Eq ' T sapote_linux_fat16_validate_payload$$'
+	@$(NM) $(KERNEL) | grep -Eq ' T sapote_linux_elf64_parse$$'
+	@$(NM) $(KERNEL) | grep -Eq ' T sapote_linux_elf64_self_test$$'
 	@$(NM) $(KERNEL) | grep -Eq ' T sapote_elf64_parse$$'
 	@$(NM) $(KERNEL) | grep -Eq ' T sapote_elf64_self_test$$'
 	@if $(NM) $(KERNEL) | grep -Eq 'panic_bounds_check'; then \
@@ -268,10 +317,20 @@ verify: toolchain lint
 		--exclude=process.c; then \
 		echo 'process proof bypasses the Boot Ledger'; exit 1; \
 	fi
+	@if grep -ERn '\blinux_abi_installed_prove[[:space:]]*[(]' \
+		src/kernel --include='*.c' --exclude=boot_plan.c \
+		--exclude=linux_abi.c; then \
+		echo 'Linux ABI proof bypasses the Boot Ledger'; exit 1; \
+	fi
 	@if grep -ERn '\bfilesystem_private_read_(open|close)[[:space:]]*[(]' \
 		src/kernel --include='*.c' --exclude=filesystem.c \
 		--exclude=process.c; then \
 		echo 'private one-file read seam escaped the process owner'; exit 1; \
+	fi
+	@if grep -ERn '\bfilesystem_linux_read_(open|close)[[:space:]]*[(]' \
+		src/kernel --include='*.c' --exclude=filesystem.c \
+		--exclude=linux_abi.c; then \
+		echo 'private BusyBox read seam escaped the Linux process owner'; exit 1; \
 	fi
 	@if grep -ERn '\bnvme_filesystem_session_(open|read|view|close)[[:space:]]*[(]' \
 		src/kernel --include='*.c' --exclude=filesystem.c --exclude=nvme.c; then \
@@ -279,18 +338,27 @@ verify: toolchain lint
 	fi
 	@! grep -Eq 'NVME_NVM_WRITE|NVM_WRITE|write[_ -]opcode' \
 		include/sapote/nvme.h src/kernel/nvme.c src/kernel/filesystem.c \
-		src/rust/fat16.rs
+		src/rust/fat16.rs src/rust/linux_fat16.rs
 	@test "$$(grep -Ec 'process_return_interrupt[[:space:]]*[(]' \
 		src/kernel/process.c)" -eq 1 && \
 		grep -Fq 'interrupt_process_gate_arm(process_return_interrupt,' \
 		src/kernel/process.c || \
 		{ echo 'process proof return handler has an unexpected call site'; exit 1; }
+	@test "$$($(NM) $(KERNEL) | grep -Ec ' T linux_syscall_entry$$')" -eq 1 || \
+		{ echo 'Linux proof has no unique architectural syscall entry'; exit 1; }
+	@$(OBJDUMP) -d $(BUSYBOX_BINARY) \
+		| grep -Eq '[[:space:]]0f 05[[:space:]]+syscall[[:space:]]*$$' || \
+		{ echo 'pinned BusyBox has no x86-64 syscall instruction'; exit 1; }
 	@if grep -ERn '(^|[^[:alnum:]_])unsafe[[:space:]]*(\{|fn|extern|trait|impl)|#\[unsafe' \
 		src/rust --include='*.rs' --exclude=abi.rs; then \
 		echo 'unsafe Rust escaped the reviewed FFI boundary'; exit 1; \
 	fi
 	@! grep -Eq '\*const|\*mut' src/rust/fat16.rs || \
 		{ echo 'safe FAT16 parser retained or exposed a raw pointer'; exit 1; }
+	@! grep -Eq '\*const|\*mut' src/rust/linux_fat16.rs || \
+		{ echo 'safe Linux FAT16 parser retained or exposed a raw pointer'; exit 1; }
+	@! grep -Eq '\*const|\*mut' src/rust/linux_elf64.rs || \
+		{ echo 'safe Linux ELF64 parser retained or exposed a raw pointer'; exit 1; }
 	@! grep -Eq '\*const|\*mut' src/rust/elf64.rs || \
 		{ echo 'safe ELF64 parser retained or exposed a raw pointer'; exit 1; }
 	@grep -Fq 'case KERNEL_TEST_DEVICE_SUBSTRATE:' src/kernel/test.c
@@ -360,6 +428,18 @@ verify: toolchain lint
 		test "$$((guest_exit * 2 + 1))" -eq "$$host_exit" && \
 		test "$$((0x33 * 2 + 1))" -ne "$$host_exit" || \
 		{ echo 'process guest and host exit contracts disagree'; exit 1; }
+	@grep -Fq 'case KERNEL_TEST_LINUX_ABI:' src/kernel/test.c
+	@grep -Fq '        return UINT8_C(0x36);' src/kernel/test.c
+	@guest_exit=$$(sed -n \
+		'/case KERNEL_TEST_LINUX_ABI:/{n;s/.*UINT8_C(\(0x[0-9A-Fa-f]*\)).*/\1/p;}' \
+		src/kernel/test.c); \
+		host_exit=$$(sed -n \
+		's/^[[:space:]]*linux-abi) expected=\([0-9][0-9]*\) ;;.*/\1/p' \
+		Makefile | head -n 1); \
+		test -n "$$guest_exit" && test -n "$$host_exit" && \
+		test "$$((guest_exit * 2 + 1))" -eq "$$host_exit" && \
+		test "$$((0x35 * 2 + 1))" -ne "$$host_exit" || \
+		{ echo 'Linux ABI guest and host exit contracts disagree'; exit 1; }
 	@if grep -En '\bframebuffer_(write_pixel|fill|scroll_up)[[:space:]]*[(]' \
 		src/kernel/ui.c src/kernel/ui_font.c src/kernel/pointer.c; then \
 		echo 'First Light bypasses the cached surface'; exit 1; \
@@ -458,6 +538,7 @@ qemu-test-%: $(TEST_BUILD_DIR)/%/sapote.iso
 		nvme) expected=101 ;; \
 		filesystem) expected=103 ;; \
 		process) expected=105 ;; \
+		linux-abi) expected=109 ;; \
 		*) echo 'unknown QEMU scenario: $*'; exit 1 ;; \
 	esac; \
 		# The ECAM and device-window scenarios depart from the default machine. \
@@ -491,6 +572,10 @@ qemu-test-%: $(TEST_BUILD_DIR)/%/sapote.iso
 				$(PYTHON) tools/make-process-fixture.py '$(PROCESS_FIXTURE)' || exit 1; \
 				test -f '$(PROCESS_FIXTURE)' || exit 1; \
 				hardware='-boot order=d -blockdev driver=file,filename=$(PROCESS_FIXTURE),node-name=process-file,read-only=on,auto-read-only=off -blockdev driver=raw,file=process-file,node-name=process-raw,read-only=on -device nvme,serial=sapote-process,drive=process-raw,logical_block_size=4096,physical_block_size=4096,max_ioqpairs=1,msix_qsize=1' ;; \
+			linux-abi) \
+				$(MAKE) '$(LINUX_ABI_FIXTURE)' || exit 1; \
+				test -f '$(LINUX_ABI_FIXTURE)' || exit 1; \
+				hardware='-boot order=d -blockdev driver=file,filename=$(LINUX_ABI_FIXTURE),node-name=linux-abi-file,read-only=on,auto-read-only=off -blockdev driver=raw,file=linux-abi-file,node-name=linux-abi-raw,read-only=on -device nvme,serial=sapote-linux-abi,drive=linux-abi-raw,logical_block_size=4096,physical_block_size=4096,max_ioqpairs=1,msix_qsize=1' ;; \
 			*) hardware='' ;; \
 	esac; \
 	log='$(TEST_BUILD_DIR)/$*/serial.log'; \
@@ -581,6 +666,9 @@ qemu-test-%: $(TEST_BUILD_DIR)/%/sapote.iso
 		  ! grep -Fxq 'Sapote: process address-space foundation controls 8/8 passed' "$$log" || \
 		  ! grep -Fxq 'Sapote: ELF64 parser robustness controls 34/34 passed' "$$log" || \
 		  ! grep -Fxq 'Sapote: process fixture absent' "$$log" || \
+		  ! grep -Fxq 'Sapote: Linux SYSCALL CPU foundation controls 10/10 passed' "$$log" || \
+		  ! grep -Fxq 'Sapote: BusyBox image and Linux stack controls 32/32 passed' "$$log" || \
+		  ! grep -Fxq 'Sapote: Linux ABI fixture absent' "$$log" || \
 		  ! grep -Eq '^Sapote: threads online, 3 ready of [0-9]+ on 12 stack frames$$' "$$log" || \
 		  ! grep -Fxq 'Sapote: thread rotation 123123123123' "$$log" || \
 		  ! grep -Eq '^Sapote: threads switched [1-9][0-9]* times, 3 exited$$' "$$log" || \
@@ -714,6 +802,12 @@ qemu-test-%: $(TEST_BUILD_DIR)/%/sapote.iso
 			grep -Fxq 'Sapote: FAT16 fixture absent' "$$log" && \
 			grep -Fxq 'Sapote: process address-space foundation controls 8/8 passed' "$$log" && \
 			grep -Fxq 'Sapote: ELF64 parser robustness controls 34/34 passed' "$$log" || \
+				diagnostics_ok=false ;; \
+		linux-abi) \
+			grep -Fxq 'ST LINUX ABI busybox echo bytes 7 syscalls 9 stdout valid exit 0 ring 3 address-space private teardown clean robustness 72' "$$log" && \
+			grep -Fxq 'Sapote: Linux SYSCALL CPU foundation controls 10/10 passed' "$$log" && \
+			grep -Fxq 'Sapote: BusyBox image and Linux stack controls 32/32 passed' "$$log" && \
+			grep -Fqx 'SAPOTE' "$$log" || \
 				diagnostics_ok=false ;; \
 		thread-guard) \
 			grep -Fq 'ST THREAD guard 0x0000000800005000' "$$log" && \

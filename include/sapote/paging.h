@@ -29,6 +29,23 @@
     (PAGING_PROCESS_STACK_BASE + \
         PAGING_PROCESS_STACK_PAGES * PAGING_PAGE_SIZE)
 
+/* The fixed high-user layout admitted only by the v0.8.0 BusyBox proof. */
+#define PAGING_LINUX_IMAGE_BASE UINT64_C(0x0000400001000000)
+#define PAGING_LINUX_IMAGE_PAGES 9U
+#define PAGING_LINUX_IMAGE_END \
+    (PAGING_LINUX_IMAGE_BASE + PAGING_LINUX_IMAGE_PAGES * PAGING_PAGE_SIZE)
+#define PAGING_LINUX_HEAP_BASE UINT64_C(0x0000400001100000)
+#define PAGING_LINUX_HEAP_PAGES 2U
+#define PAGING_LINUX_ANON_ADDRESS UINT64_C(0x0000400001110000)
+#define PAGING_LINUX_STACK_GUARD UINT64_C(0x0000400001200000)
+#define PAGING_LINUX_STACK_PAGES 4U
+#define PAGING_LINUX_STACK_BASE \
+    (PAGING_LINUX_STACK_GUARD + PAGING_PAGE_SIZE)
+#define PAGING_LINUX_STACK_END \
+    (PAGING_LINUX_STACK_BASE + PAGING_LINUX_STACK_PAGES * PAGING_PAGE_SIZE)
+#define PAGING_PROCESS_ALIAS_MAX_PAGES 16U
+#define PAGING_PROCESS_EXPECTED_MAX_PAGES 24U
+
 /* console.c's fallback output page, described here once for every owner. */
 #define PAGING_VGA_TEXT_BUFFER_BASE UINT64_C(0x000B8000)
 
@@ -220,6 +237,10 @@ enum paging_process_space_state {
 enum paging_process_mapping_kind {
     PAGING_PROCESS_MAPPING_IMAGE = 0,
     PAGING_PROCESS_MAPPING_STACK,
+    PAGING_PROCESS_MAPPING_LINUX_IMAGE,
+    PAGING_PROCESS_MAPPING_LINUX_STACK,
+    PAGING_PROCESS_MAPPING_LINUX_HEAP,
+    PAGING_PROCESS_MAPPING_LINUX_ANON,
     PAGING_PROCESS_MAPPING_KIND_COUNT
 };
 
@@ -235,6 +256,19 @@ struct paging_process_image_alias {
     uint64_t physical_address;
     uint64_t generation;
     bool active;
+};
+
+struct paging_process_alias_set {
+    uint64_t physical_addresses[PAGING_PROCESS_ALIAS_MAX_PAGES];
+    uint64_t generation;
+    size_t count;
+    bool active;
+};
+
+struct paging_process_expected_page {
+    uint64_t virtual_address;
+    uint64_t physical_address;
+    uint32_t permissions;
 };
 
 /*
@@ -291,6 +325,12 @@ enum paging_status paging_process_image_alias_narrow(
     uint64_t physical_address,
     struct paging_process_image_alias *alias
 );
+enum paging_status paging_process_alias_set_narrow(
+    const struct paging_process_space *space,
+    const uint64_t *physical_addresses,
+    size_t count,
+    struct paging_process_alias_set *alias
+);
 enum paging_status paging_process_map_user_page(
     struct paging_process_space *space,
     enum paging_process_mapping_kind kind,
@@ -308,6 +348,11 @@ enum paging_status paging_process_validate(
     uint64_t image_physical_address,
     const uintptr_t stack_frames[PAGING_PROCESS_STACK_PAGES]
 );
+enum paging_status paging_process_validate_linux(
+    struct paging_process_space *space,
+    const struct paging_process_expected_page *pages,
+    size_t page_count
+);
 enum paging_status paging_process_translate(
     const struct paging_process_space *space,
     uint64_t virtual_address,
@@ -320,6 +365,10 @@ enum paging_status paging_process_restore_kernel(
 enum paging_status paging_process_image_alias_restore(
     const struct paging_process_space *space,
     struct paging_process_image_alias *alias
+);
+enum paging_status paging_process_alias_set_restore(
+    const struct paging_process_space *space,
+    struct paging_process_alias_set *alias
 );
 enum paging_status paging_process_space_release(
     struct paging_process_space *space

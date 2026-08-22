@@ -1,0 +1,222 @@
+name: Linux ABI and BusyBox milestone evidence
+
+on:
+    pull_request:
+        branches: [main]
+    workflow_dispatch:
+
+permissions:
+    contents: read
+
+concurrency:
+    group: linux-abi-milestone-${{ github.ref }}
+    cancel-in-progress: true
+
+jobs:
+    bounded-evidence:
+        name: bounded-linux-abi-evidence
+        runs-on: ubuntu-24.04
+        timeout-minutes: 240
+        steps:
+            - name: Check out source
+              uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+              with:
+                  persist-credentials: false
+            - name: Install build and trace tools
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  sudo sed -i '\|azure.archive.ubuntu.com|d' /etc/apt/apt-mirrors.txt
+                  sudo apt-get update
+                  sudo apt-get install --yes --no-install-recommends \
+                      binutils build-essential bzip2 curl file grub-common \
+                      grub-pc-bin make mtools qemu-system-x86 qemu-user \
+                      strace xorriso
+            - name: Install the Rust bare-metal target
+              run: rustup target add x86_64-unknown-none
+            - name: Record the emulated and accelerator surface
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  mkdir -p evidence/linux-abi
+                  qemu-system-x86_64 -version \
+                      | tee evidence/linux-abi/qemu-version.txt
+                  qemu-system-x86_64 -device nvme,help \
+                      | tee evidence/linux-abi/qemu-nvme-help.txt
+                  qemu-system-x86_64 -accel help \
+                      | tee evidence/linux-abi/accelerator-help.txt
+                  grep -Fxq tcg evidence/linux-abi/accelerator-help.txt
+            - name: Verify source, host contracts, kernel, and fixtures
+              run: make verify
+            - name: Rebuild and trace BusyBox twice from clean trees
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  rm -rf build/linux-abi-release
+                  bash tools/build-busybox-proof.sh \
+                      build/linux-abi-release/build-one \
+                      build/linux-abi-release/work-one
+                  bash tools/build-busybox-proof.sh \
+                      build/linux-abi-release/build-two \
+                      build/linux-abi-release/work-two
+                  cmp build/linux-abi-release/build-one/busybox \
+                      build/linux-abi-release/build-two/busybox
+                  cmp build/linux-abi-release/build-one/busybox.config \
+                      build/linux-abi-release/build-two/busybox.config
+                  cp build/linux-abi-release/build-one/build-record.txt \
+                      evidence/linux-abi/reproducible-build-provenance.txt
+                  printf 'clean build two binary SHA-256: %s\n' \
+                      "$(sha256sum build/linux-abi-release/build-two/busybox | awk '{print toupper($1)}')" \
+                      >>evidence/linux-abi/reproducible-build-provenance.txt
+                  printf 'two clean source and musl builds: byte-identical\n' \
+                      >>evidence/linux-abi/reproducible-build-provenance.txt
+                  cp build/linux-abi-release/build-one/syscall-trace.txt \
+                      evidence/linux-abi/busybox-syscall-trace.txt
+                  cp build/linux-abi-release/build-one/syscall-sequence.txt \
+                      evidence/linux-abi/busybox-syscall-sequence.txt
+                  cp userspace/busybox/syscall-allowlist.txt \
+                      evidence/linux-abi/syscall-allowlist.txt
+            - name: Run ten complete serial TCG sweeps
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  scenario_count=$(
+                      make --no-print-directory -s contract-scenarios | wc -l
+                  )
+                  test "$scenario_count" -eq 38
+                  for sweep in $(seq -w 1 10); do
+                      raw="evidence/linux-abi/tcg-sweep-${sweep}-raw.txt"
+                      normalized="evidence/linux-abi/tcg-sweep-${sweep}.txt"
+                      make qemu-tests QEMU_ACCEL=tcg | tee "$raw"
+                      grep -E '^QEMU scenario [a-z0-9-]+ passed$' \
+                          "$raw" >"$normalized"
+                      test "$(wc -l <"$normalized")" -eq "$scenario_count"
+                      cp build/tests/linux-abi/serial.log \
+                          "evidence/linux-abi/linux-abi-sweep-${sweep}.log"
+                      rm "$raw"
+                  done
+                  proof=evidence/linux-abi/linux-abi-sweep-10.log
+                  grep -Fx 'SAPOTE' "$proof" \
+                      >evidence/linux-abi/stable-busybox-transcript.txt
+                  grep -Fx \
+                      'ST LINUX ABI busybox echo bytes 7 syscalls 9 stdout valid exit 0 ring 3 address-space private teardown clean robustness 72' \
+                      "$proof" >>evidence/linux-abi/stable-busybox-transcript.txt
+                  grep -Fx 'ST PASS linux-abi' "$proof" \
+                      >>evidence/linux-abi/stable-busybox-transcript.txt
+                  cp build/tests/boot-ledger/serial.log \
+                      evidence/linux-abi/ordinary-ledger.log
+                  rm evidence/linux-abi/linux-abi-sweep-*.log
+            - name: Record accelerator availability without host-device probes
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  {
+                      printf 'TCG available: ten complete 38-scenario sweeps passed.\n'
+                      printf 'KVM unavailable by authorization: no host device file was probed or opened.\n'
+                      printf 'WHPX unavailable on this Linux runner.\n'
+                      printf 'HVF unavailable on this Linux runner.\n'
+                      printf 'NVMM unavailable on this Linux runner.\n'
+                      printf 'HAX unavailable on this Linux runner.\n'
+                      printf 'Safely exposed hardware accelerators on this runner: none.\n'
+                  } >evidence/linux-abi/accelerator-results.txt
+            - name: Assemble bounded v0.8.0 release evidence
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  release=evidence/linux-abi
+                  first=build/linux-abi-release/build-one
+                  make iso
+                  cp build/sapote.iso "$release/Sapote-v0.8.0.iso"
+                  cp build/sapote.elf "$release/sapote-v0.8.0.elf"
+                  cp "$first/busybox" "$release/busybox"
+                  cp userspace/busybox/busybox.config \
+                      "$release/busybox.config"
+                  cp userspace/busybox/BUSYBOX-LICENSE \
+                      "$release/BUSYBOX-LICENSE"
+                  cp userspace/busybox/MUSL-COPYRIGHT \
+                      "$release/MUSL-COPYRIGHT"
+                  cp userspace/busybox/source/busybox-1.38.0.tar.bz2 \
+                      "$release/busybox-1.38.0.tar.bz2"
+                  cp userspace/busybox/source/musl-1.2.6.tar.gz \
+                      "$release/musl-1.2.6.tar.gz"
+                  python3 tools/make-linux-abi-fixture.py "$first/busybox" \
+                      build/linux-abi-release/linux-abi-fat16.raw
+                  fixture_sha=$(
+                      sha256sum build/linux-abi-release/linux-abi-fat16.raw \
+                          | awk '{print toupper($1)}'
+                  )
+                  test "$fixture_sha" = \
+                      41513E5D6F4C33F898F887D4F40F37149A29B1AE13B5E8A600495C18A38C7A6F
+                  {
+                      printf 'Sapote v0.8.0 deterministic Linux ABI fixture\n'
+                      printf 'logical sectors / bytes: 4096 / 4096\n'
+                      printf 'FAT: LBA 1-2; root: LBA 3, 128 entries\n'
+                      printf 'BUSYBOX: clusters 2-10, LBA 4-12, 33584 bytes\n'
+                      printf 'BUSYBOX SHA-256: B308F2CAD5B5CD0EEB92A622DEC8D71C1A08F628A22CDC5BCDE2B98B53220746\n'
+                      printf 'fixture SHA-256: %s\n' "$fixture_sha"
+                      printf 'backend: repository-workspace regular file, raw, guest read-only\n'
+                  } >"$release/fixture-layout-digests.txt"
+                  {
+                      printf 'BusyBox 1.38.0: GPL-2.0-or-later separate userspace work.\n'
+                      printf 'Exact source archive, complete configuration, LICENSE, build script, and checksums are distributed.\n'
+                      printf 'musl 1.2.6: MIT-licensed static-libc toolchain source; exact source and COPYRIGHT are distributed.\n'
+                      printf 'Neither BusyBox nor musl is linked into or copied into the GPL-3.0-only Sapote kernel.\n'
+                  } >"$release/source-license-record.txt"
+                  ordinary_record=$(
+                      grep -E '^ST LEDGER stages [1-9][0-9]* receipts [1-9][0-9]* capabilities [1-9][0-9]* skips [0-9]+ fingerprint 0x[0-9A-F]{16}$' \
+                          "$release/ordinary-ledger.log"
+                  )
+                  test -n "$ordinary_record"
+                  rm "$release/ordinary-ledger.log"
+                  read -r scenario_count assertion_count < <(
+                      make --no-print-directory -s contract-counts
+                  )
+                  source_lines=$(
+                      find src include -type f -print0 \
+                          | sort -z | xargs -0 -r cat | wc -l
+                  )
+                  {
+                      printf 'Sapote v0.8.0 Linux ABI and BusyBox Foundation verification\n'
+                      printf 'commit: %s\n' "$GITHUB_SHA"
+                      printf 'tree: %s\n' "$(git rev-parse 'HEAD^{tree}')"
+                      printf 'scenarios per sweep: %s\n' "$scenario_count"
+                      printf 'Boot Ledger capacity: %s stages, %s receipts, %s capabilities per stage\n' \
+                          "$(sed -nE 's/^#define BOOT_LEDGER_STAGE_CAPACITY ([0-9]+)U$/\1/p' include/sapote/boot_ledger.h)" \
+                          "$(sed -nE 's/^#define BOOT_LEDGER_RECEIPT_CAPACITY ([0-9]+)U$/\1/p' include/sapote/boot_ledger.h)" \
+                          "$(sed -nE 's/^#define BOOT_STAGE_CAPABILITY_CAPACITY ([0-9]+)U$/\1/p' include/sapote/boot_ledger.h)"
+                      printf 'ordinary ledger: %s\n' "$ordinary_record"
+                      printf 'source lines (src and include): %s\n' "$source_lines"
+                      printf 'shell assertion lines: %s\n' "$assertion_count"
+                      printf 'kernel bytes: %s\n' "$(stat -c %s build/sapote.elf)"
+                      printf 'ISO bytes: %s\n' "$(stat -c %s build/sapote.iso)"
+                      printf 'make verify: passed without warnings\n'
+                      printf 'all 38 scenarios: passed individually\n'
+                      printf 'serial TCG complete sweeps: 10 passed\n'
+                      cat "$release/accelerator-results.txt"
+                      printf 'BusyBox reproducibility: two clean builds byte-identical\n'
+                      printf 'ELF/runtime: static ET_EXEC, no interpreter, relocation, GOT dependency, or RWX segment\n'
+                      printf 'execution: CPL3 fetch from NVMe image and real SYSCALL entry; int 0x81 excluded\n'
+                      printf 'teardown: kernel CR3 and complete safe resource census restored\n'
+                      printf 'controlled robustness results: 72 passed\n'
+                  } >"$release/verification-summary.txt"
+                  {
+                      printf 'Controlled Linux ABI robustness results\n'
+                      printf 'Rust mutation tests, guest foundation controls, installed permission/provenance checks, and source/host contracts passed.\n'
+                      printf 'Result: controls 1-72 passed.\n'
+                      printf 'Matrix: docs/LINUX_ABI_QEMU_PROOF.md.\n'
+                  } >"$release/controlled-robustness-results.txt"
+                  rm -f "$release/SHA256SUMS"
+                  (
+                      cd "$release"
+                      find . -maxdepth 1 -type f ! -name SHA256SUMS -print0 \
+                          | sort -z | xargs -0 sha256sum >SHA256SUMS
+                  )
+                  cat "$release/verification-summary.txt"
+                  cat "$release/SHA256SUMS"
+            - name: Upload v0.8.0 milestone evidence
+              uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+              with:
+                  name: sapote-linux-abi-milestone-${{ github.sha }}
+                  path: evidence/linux-abi
+                  if-no-files-found: error
+                  retention-days: 30

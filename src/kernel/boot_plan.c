@@ -32,6 +32,8 @@
 #include <sapote/logo.h>
 #include <sapote/ioapic.h>
 #include <sapote/keyboard.h>
+#include <sapote/linux_abi.h>
+#include <sapote/linux_syscall.h>
 #include <sapote/memory.h>
 #include <sapote/msix.h>
 #include <sapote/nvme.h>
@@ -1236,9 +1238,10 @@ static void execute_nvme_read_proof(
         return;
     }
 
-    /* The filesystem and process scenarios own different namespaces. */
+    /* The filesystem, process, and Linux scenarios own other namespaces. */
     if (context->test_scenario == KERNEL_TEST_FILESYSTEM ||
-        context->test_scenario == KERNEL_TEST_PROCESS) {
+        context->test_scenario == KERNEL_TEST_PROCESS ||
+        context->test_scenario == KERNEL_TEST_LINUX_ABI) {
         console_write("Sapote: NVMe fixture absent\n");
         boot_stage_result_skip(descriptor, result);
         return;
@@ -1354,9 +1357,10 @@ static void execute_filesystem_file_proof(
         return;
     }
 
-    /* Preserve scenario 35's raw and scenario 37's ELF namespaces. */
+    /* Preserve the raw, process-ELF, and BusyBox fixture namespaces. */
     if (context->test_scenario == KERNEL_TEST_NVME ||
-        context->test_scenario == KERNEL_TEST_PROCESS) {
+        context->test_scenario == KERNEL_TEST_PROCESS ||
+        context->test_scenario == KERNEL_TEST_LINUX_ABI) {
         console_write("Sapote: FAT16 fixture absent\n");
         boot_stage_result_skip(descriptor, result);
         return;
@@ -1468,8 +1472,12 @@ static const enum boot_capability process_proof_requirements[] = {
 
 _Static_assert(sizeof(process_proof_requirements) /
     sizeof(process_proof_requirements[0]) ==
+        18U,
+    "process proof prerequisite count changed");
+_Static_assert(sizeof(process_proof_requirements) /
+    sizeof(process_proof_requirements[0]) <=
         BOOT_STAGE_CAPABILITY_CAPACITY,
-    "process proof prerequisites no longer exactly fill the bound");
+    "process proof prerequisites exceed the descriptor bound");
 
 static bool process_proof_dependencies_complete(
     const struct boot_stage_descriptor *descriptor
@@ -1540,6 +1548,143 @@ static void execute_process_installed_proof(
     boot_stage_result_succeed(descriptor, result);
     result->proof_counters[0] = proof.file_bytes;
     result->proof_counters[1] = proof.segment_count;
+    result->proof_counter_count = 2U;
+}
+
+static void execute_linux_syscall_cpu_foundation(
+    struct boot_context *context,
+    const struct boot_stage_descriptor *descriptor,
+    struct boot_stage_result *result
+)
+{
+    size_t completed = 0U;
+
+    if (!linux_syscall_cpu_foundation_self_test(&completed) ||
+        completed != LINUX_SYSCALL_CPU_FOUNDATION_CONTROLS) {
+        stage_failed(context, result,
+            "Linux SYSCALL CPU foundation controls failed");
+        return;
+    }
+    console_write("Sapote: Linux SYSCALL CPU foundation controls ");
+    console_write_u64(completed);
+    console_putc('/');
+    console_write_u64(LINUX_SYSCALL_CPU_FOUNDATION_CONTROLS);
+    console_write(" passed\n");
+    boot_stage_result_succeed(descriptor, result);
+}
+
+static void execute_linux_image_stack_foundation(
+    struct boot_context *context,
+    const struct boot_stage_descriptor *descriptor,
+    struct boot_stage_result *result
+)
+{
+    size_t completed = 0U;
+
+    if (!linux_abi_image_stack_foundation_self_test(&completed) ||
+        completed != LINUX_ABI_IMAGE_STACK_FOUNDATION_CONTROLS) {
+        stage_failed(context, result,
+            "BusyBox ELF and Linux initial-stack controls failed");
+        return;
+    }
+    console_write("Sapote: BusyBox image and Linux stack controls ");
+    console_write_u64(completed);
+    console_putc('/');
+    console_write_u64(LINUX_ABI_IMAGE_STACK_FOUNDATION_CONTROLS);
+    console_write(" passed\n");
+    boot_stage_result_succeed(descriptor, result);
+}
+
+static const enum boot_capability linux_proof_requirements[] = {
+    BOOT_CAPABILITY_PAGE_TABLES_INSTALLED,
+    BOOT_CAPABILITY_WRITE_XOR_EXECUTE_PROVED,
+    BOOT_CAPABILITY_PHYSICAL_FRAME_ALLOCATOR_AVAILABLE,
+    BOOT_CAPABILITY_HEAP_AVAILABLE,
+    BOOT_CAPABILITY_IDT_INSTALLED,
+    BOOT_CAPABILITY_INTERRUPT_CONTROLLERS_CONFIGURED,
+    BOOT_CAPABILITY_INTERRUPTS_ENABLED,
+    BOOT_CAPABILITY_TIMER_CALIBRATION_COMPLETE,
+    BOOT_CAPABILITY_PCI_ACCESS_AVAILABLE,
+    BOOT_CAPABILITY_THREADING_AVAILABLE,
+    BOOT_CAPABILITY_SCHEDULER_AVAILABLE,
+    BOOT_CAPABILITY_PCI_RESOURCE_OWNERSHIP_AVAILABLE,
+    BOOT_CAPABILITY_DYNAMIC_VECTOR_FOUNDATION_AVAILABLE,
+    BOOT_CAPABILITY_DMA_FOUNDATION_AVAILABLE,
+    BOOT_CAPABILITY_NVME_FOUNDATION_AVAILABLE,
+    BOOT_CAPABILITY_FAT16_FOUNDATION_AVAILABLE,
+    BOOT_CAPABILITY_PRIVATE_ONE_FILE_READ_AVAILABLE,
+    BOOT_CAPABILITY_PROCESS_ADDRESS_SPACE_FOUNDATION_AVAILABLE,
+    BOOT_CAPABILITY_ELF64_LOADER_FOUNDATION_AVAILABLE,
+    BOOT_CAPABILITY_LINUX_SYSCALL_CPU_FOUNDATION_AVAILABLE,
+    BOOT_CAPABILITY_LINUX_IMAGE_STACK_FOUNDATION_AVAILABLE
+};
+
+_Static_assert(sizeof(linux_proof_requirements) /
+    sizeof(linux_proof_requirements[0]) == BOOT_STAGE_CAPABILITY_CAPACITY,
+    "Linux proof prerequisites no longer exactly fill the bound");
+
+static bool linux_proof_dependencies_complete(
+    const struct boot_stage_descriptor *descriptor
+)
+{
+    return dependencies_complete(descriptor, linux_proof_requirements,
+        sizeof(linux_proof_requirements) /
+            sizeof(linux_proof_requirements[0]));
+}
+
+static void execute_linux_installed_proof(
+    struct boot_context *context,
+    const struct boot_stage_descriptor *descriptor,
+    struct boot_stage_result *result
+)
+{
+    struct boot_stage_descriptor missing_count;
+    struct boot_stage_descriptor missing_member;
+    struct linux_abi_proof_result proof;
+    enum linux_abi_status status;
+
+    if (!linux_proof_dependencies_complete(descriptor)) {
+        stage_failed(context, result,
+            "Linux proof prerequisite set is incomplete");
+        return;
+    }
+    missing_count = *descriptor;
+    --missing_count.required_capability_count;
+    missing_member = *descriptor;
+    missing_member.required_capabilities[
+        missing_member.required_capability_count - 1U] =
+            missing_member.required_capabilities[0];
+    if (linux_proof_dependencies_complete(&missing_count) ||
+        linux_proof_dependencies_complete(&missing_member) ||
+        !kernel_test_linux_abi_exit_self_test()) {
+        stage_failed(context, result,
+            "Linux proof contract negative controls failed");
+        return;
+    }
+    if (context->test_scenario != KERNEL_TEST_LINUX_ABI) {
+        console_write("Sapote: Linux ABI fixture absent\n");
+        boot_stage_result_skip(descriptor, result);
+        return;
+    }
+    status = linux_abi_installed_prove(&proof);
+    if (status == LINUX_ABI_STATUS_ABSENT) {
+        console_write("Sapote: Linux ABI fixture absent\n");
+        boot_stage_result_skip(descriptor, result);
+        return;
+    }
+    if (status != LINUX_ABI_STATUS_OK) {
+        console_write("Sapote: Linux ABI proof violated invariant: ");
+        console_write(linux_abi_status_string(status));
+        console_putc('\n');
+        stage_failed(context, result, linux_abi_status_string(status));
+        return;
+    }
+    console_write(
+        "ST LINUX ABI busybox echo bytes 7 syscalls 9 stdout valid exit 0 "
+        "ring 3 address-space private teardown clean robustness 72\n");
+    boot_stage_result_succeed(descriptor, result);
+    result->proof_counters[0] = proof.file_bytes;
+    result->proof_counters[1] = proof.syscall_count;
     result->proof_counter_count = 2U;
 }
 
@@ -1856,6 +2001,13 @@ static const struct boot_stage_descriptor installed_descriptors[] = {
     REQUIRED_STAGE(BOOT_STAGE_ELF64_LOADER_FOUNDATION,
         "bounded ELF64 loader foundation", BOOT_PHASE_SERVICES,
         BOOT_IRREVERSIBLE_NONE, execute_elf64_loader_foundation),
+    REQUIRED_STAGE(BOOT_STAGE_LINUX_SYSCALL_CPU_FOUNDATION,
+        "Linux x86-64 syscall CPU foundation", BOOT_PHASE_SERVICES,
+        BOOT_IRREVERSIBLE_NONE, execute_linux_syscall_cpu_foundation),
+    REQUIRED_STAGE(BOOT_STAGE_LINUX_IMAGE_STACK_FOUNDATION,
+        "static BusyBox image and Linux initial-stack foundation",
+        BOOT_PHASE_SERVICES, BOOT_IRREVERSIBLE_NONE,
+        execute_linux_image_stack_foundation),
     OPTIONAL_NEUTRAL_STAGE(BOOT_STAGE_DEVICE_SUBSTRATE_PROOF,
         "installed device-substrate proof", BOOT_PHASE_SERVICES,
         BOOT_IRREVERSIBLE_NONE, execute_device_substrate_proof),
@@ -1871,6 +2023,9 @@ static const struct boot_stage_descriptor installed_descriptors[] = {
     OPTIONAL_NEUTRAL_STAGE(BOOT_STAGE_PROCESS_INSTALLED_PROOF,
         "installed Ring 3 process proof", BOOT_PHASE_SERVICES,
         BOOT_IRREVERSIBLE_NONE, execute_process_installed_proof),
+    OPTIONAL_NEUTRAL_STAGE(BOOT_STAGE_LINUX_INSTALLED_PROOF,
+        "installed static BusyBox proof", BOOT_PHASE_SERVICES,
+        BOOT_IRREVERSIBLE_NONE, execute_linux_installed_proof),
     REQUIRED_STAGE(BOOT_STAGE_CLOSING_PROOFS, "closing boot proofs",
         BOOT_PHASE_PROOFS, BOOT_IRREVERSIBLE_NONE, execute_closing_proofs),
     OPTIONAL_STAGE(BOOT_STAGE_DESKTOP_CONSTRUCTION, "desktop construction",
@@ -2412,6 +2567,36 @@ static bool declare_dependencies(
             BOOT_CAPABILITY_ELF64_LOADER_FOUNDATION_AVAILABLE;
         descriptor->provided_capability_count = 1U;
         break;
+    case BOOT_STAGE_LINUX_SYSCALL_CPU_FOUNDATION:
+        descriptor->required_capabilities[0] =
+            BOOT_CAPABILITY_PAGE_TABLES_INSTALLED;
+        descriptor->required_capabilities[1] =
+            BOOT_CAPABILITY_IDT_INSTALLED;
+        descriptor->required_capabilities[2] =
+            BOOT_CAPABILITY_INTERRUPT_CONTROLLERS_CONFIGURED;
+        descriptor->required_capabilities[3] =
+            BOOT_CAPABILITY_PROCESS_ADDRESS_SPACE_FOUNDATION_AVAILABLE;
+        descriptor->required_capability_count = 4U;
+        descriptor->provided_capabilities[0] =
+            BOOT_CAPABILITY_LINUX_SYSCALL_CPU_FOUNDATION_AVAILABLE;
+        descriptor->provided_capability_count = 1U;
+        break;
+    case BOOT_STAGE_LINUX_IMAGE_STACK_FOUNDATION:
+        descriptor->required_capabilities[0] =
+            BOOT_CAPABILITY_FAT16_FOUNDATION_AVAILABLE;
+        descriptor->required_capabilities[1] =
+            BOOT_CAPABILITY_PRIVATE_ONE_FILE_READ_AVAILABLE;
+        descriptor->required_capabilities[2] =
+            BOOT_CAPABILITY_PROCESS_ADDRESS_SPACE_FOUNDATION_AVAILABLE;
+        descriptor->required_capabilities[3] =
+            BOOT_CAPABILITY_ELF64_LOADER_FOUNDATION_AVAILABLE;
+        descriptor->required_capabilities[4] =
+            BOOT_CAPABILITY_LINUX_SYSCALL_CPU_FOUNDATION_AVAILABLE;
+        descriptor->required_capability_count = 5U;
+        descriptor->provided_capabilities[0] =
+            BOOT_CAPABILITY_LINUX_IMAGE_STACK_FOUNDATION_AVAILABLE;
+        descriptor->provided_capability_count = 1U;
+        break;
     case BOOT_STAGE_PROCESS_INSTALLED_PROOF:
         for (size_t index = 0U;
              index < sizeof(process_proof_requirements) /
@@ -2433,6 +2618,27 @@ static bool declare_dependencies(
             BOOT_CAPABILITY_PROCESS_OUTCOME_DECIDED;
         descriptor->skipped_capability_count = 2U;
         break;
+    case BOOT_STAGE_LINUX_INSTALLED_PROOF:
+        for (size_t index = 0U;
+             index < sizeof(linux_proof_requirements) /
+                sizeof(linux_proof_requirements[0]); ++index) {
+            descriptor->required_capabilities[index] =
+                linux_proof_requirements[index];
+        }
+        descriptor->required_capability_count =
+            sizeof(linux_proof_requirements) /
+                sizeof(linux_proof_requirements[0]);
+        descriptor->provided_capabilities[0] =
+            BOOT_CAPABILITY_LINUX_INSTALLED_PROOF_COMPLETE;
+        descriptor->provided_capabilities[1] =
+            BOOT_CAPABILITY_LINUX_OUTCOME_DECIDED;
+        descriptor->provided_capability_count = 2U;
+        descriptor->skipped_capabilities[0] =
+            BOOT_CAPABILITY_LINUX_FIXTURE_ABSENT;
+        descriptor->skipped_capabilities[1] =
+            BOOT_CAPABILITY_LINUX_OUTCOME_DECIDED;
+        descriptor->skipped_capability_count = 2U;
+        break;
     case BOOT_STAGE_CLOSING_PROOFS:
         descriptor->required_capabilities[0] =
             BOOT_CAPABILITY_PAGE_TABLES_INSTALLED;
@@ -2450,7 +2656,13 @@ static bool declare_dependencies(
             BOOT_CAPABILITY_ELF64_LOADER_FOUNDATION_AVAILABLE;
         descriptor->required_capabilities[7] =
             BOOT_CAPABILITY_PROCESS_OUTCOME_DECIDED;
-        descriptor->required_capability_count = 8U;
+        descriptor->required_capabilities[8] =
+            BOOT_CAPABILITY_LINUX_SYSCALL_CPU_FOUNDATION_AVAILABLE;
+        descriptor->required_capabilities[9] =
+            BOOT_CAPABILITY_LINUX_IMAGE_STACK_FOUNDATION_AVAILABLE;
+        descriptor->required_capabilities[10] =
+            BOOT_CAPABILITY_LINUX_OUTCOME_DECIDED;
+        descriptor->required_capability_count = 11U;
         descriptor->provided_capabilities[0] =
             BOOT_CAPABILITY_BOOT_PROOFS_COMPLETE;
         descriptor->provided_capability_count = 1U;

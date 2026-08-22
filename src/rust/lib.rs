@@ -24,6 +24,8 @@
 pub mod abi;
 pub mod elf64;
 pub mod fat16;
+pub(crate) mod linux_fat16;
+pub(crate) mod linux_elf64;
 pub mod font;
 pub mod logo;
 pub mod ui_font;

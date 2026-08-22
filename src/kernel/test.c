@@ -28,6 +28,7 @@
 #include <sapote/pointer.h>
 #include <sapote/process.h>
 #include <sapote/keyboard.h>
+#include <sapote/linux_abi.h>
 #include <sapote/screen.h>
 #include <sapote/shell.h>
 #include <sapote/pm_timer.h>
@@ -308,6 +309,10 @@ static enum kernel_test_scenario scenario_from_value(
         return KERNEL_TEST_PROCESS;
     }
 
+    if (token_equals(value, length, "linux-abi")) {
+        return KERNEL_TEST_LINUX_ABI;
+    }
+
     return KERNEL_TEST_INVALID;
 }
 
@@ -397,6 +402,8 @@ static uint8_t scenario_exit_value(enum kernel_test_scenario scenario)
         return UINT8_C(0x33);
     case KERNEL_TEST_PROCESS:
         return UINT8_C(0x34);
+    case KERNEL_TEST_LINUX_ABI:
+        return UINT8_C(0x36);
     default:
         return QEMU_FAILURE_VALUE;
     }
@@ -457,6 +464,19 @@ bool kernel_test_process_exit_self_test(void)
 {
     return process_exit_contract(scenario_exit_value(KERNEL_TEST_PROCESS)) &&
         !process_exit_contract(UINT8_C(0x33));
+}
+
+static bool linux_abi_exit_contract(uint8_t value)
+{
+    return value == UINT8_C(0x36);
+}
+
+bool kernel_test_linux_abi_exit_self_test(void)
+{
+    return linux_abi_exit_contract(
+            scenario_exit_value(KERNEL_TEST_LINUX_ABI)) &&
+        !linux_abi_exit_contract(UINT8_C(0x35)) &&
+        !linux_abi_exit_contract(UINT8_C(0x34));
 }
 
 static void test_marker(const char *kind, enum kernel_test_scenario scenario)
@@ -4036,6 +4056,9 @@ void kernel_test_run(
     case KERNEL_TEST_PROCESS:
         /* Deferred until the proof receipt is installed and published. */
         return;
+    case KERNEL_TEST_LINUX_ABI:
+        /* Deferred until the proof receipt is installed and published. */
+        return;
     case KERNEL_TEST_DOUBLE_FAULT:
         kernel_test_double_fault_armed = 1U;
         interrupt_test_set_gate_present(14U, false);
@@ -4825,6 +4848,59 @@ _Noreturn void kernel_test_complete_process(void)
     kernel_test_pass();
 }
 
+_Noreturn void kernel_test_complete_linux_abi(void)
+{
+    const struct boot_ledger *ledger = boot_ledger_installed();
+    const struct boot_stage_receipt *syscall_cpu;
+    const struct boot_stage_receipt *image_stack;
+    const struct boot_stage_receipt *receipt;
+    const struct linux_abi_proof_result proof =
+        linux_abi_get_proof_result();
+
+    if (active_scenario != KERNEL_TEST_LINUX_ABI) {
+        kernel_test_fail("Linux ABI completion used outside its scenario");
+    }
+    syscall_cpu = boot_ledger_receipt_for(ledger,
+        BOOT_STAGE_LINUX_SYSCALL_CPU_FOUNDATION);
+    image_stack = boot_ledger_receipt_for(ledger,
+        BOOT_STAGE_LINUX_IMAGE_STACK_FOUNDATION);
+    receipt = boot_ledger_receipt_for(ledger,
+        BOOT_STAGE_LINUX_INSTALLED_PROOF);
+    if (ledger == NULL || syscall_cpu == NULL || image_stack == NULL ||
+        receipt == NULL || syscall_cpu->result != BOOT_RECEIPT_RAN ||
+        image_stack->result != BOOT_RECEIPT_RAN ||
+        receipt->result != BOOT_RECEIPT_RAN ||
+        receipt->proof_counter_count != 2U ||
+        receipt->proof_counters[0] != 33584U ||
+        receipt->proof_counters[1] != 9U ||
+        !boot_ledger_has_capability(ledger,
+            BOOT_CAPABILITY_LINUX_SYSCALL_CPU_FOUNDATION_AVAILABLE) ||
+        !boot_ledger_has_capability(ledger,
+            BOOT_CAPABILITY_LINUX_IMAGE_STACK_FOUNDATION_AVAILABLE) ||
+        !boot_ledger_has_capability(ledger,
+            BOOT_CAPABILITY_LINUX_INSTALLED_PROOF_COMPLETE) ||
+        !boot_ledger_has_capability(ledger,
+            BOOT_CAPABILITY_LINUX_OUTCOME_DECIDED) ||
+        boot_ledger_has_capability(ledger,
+            BOOT_CAPABILITY_LINUX_FIXTURE_ABSENT)) {
+        kernel_test_fail("Linux ABI installed receipt is invalid");
+    }
+    if (proof.file_bytes != 33584U || proof.program_headers != 5U ||
+        proof.load_segments != 4U || proof.file_clusters != 9U ||
+        proof.stdout_bytes != 7U || proof.syscall_count != 9U ||
+        proof.distinct_syscalls != 7U || proof.exit_status != 0U ||
+        proof.robustness_tests != LINUX_ABI_CONTROLLED_ROBUSTNESS_TESTS ||
+        !proof.ring_three || !proof.private_address_space ||
+        !proof.real_syscall_instruction || !proof.stdout_valid ||
+        !proof.exit_zero || !proof.unknown_enosys ||
+        !proof.write_xor_execute || !proof.kernel_cr3_restored ||
+        !proof.teardown_complete || !proof.resource_census_equal ||
+        !linux_abi_resources_released()) {
+        kernel_test_fail("Linux ABI installed proof is inconsistent");
+    }
+    kernel_test_pass();
+}
+
 bool kernel_test_handle_fatal_interrupt(const struct interrupt_frame *frame)
 {
     bool matches = false;
@@ -4961,6 +5037,8 @@ const char *kernel_test_scenario_name(enum kernel_test_scenario scenario)
         return "filesystem";
     case KERNEL_TEST_PROCESS:
         return "process";
+    case KERNEL_TEST_LINUX_ABI:
+        return "linux-abi";
     case KERNEL_TEST_INVALID:
         return "invalid";
     default:

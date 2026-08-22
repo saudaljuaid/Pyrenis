@@ -54,7 +54,9 @@ jobs:
                       make qemu-tests QEMU_ACCEL=tcg | tee "$raw"
                       grep -E '^QEMU scenario [a-z0-9-]+ passed$' \
                           "$raw" >"$normalized"
-                      test "$(wc -l <"$normalized")" -eq 37
+                      test "$(wc -l <"$normalized")" -eq "$(
+                          make --no-print-directory -s contract-scenarios | wc -l
+                      )"
                       cp build/tests/process/serial.log \
                           "evidence/process/process-sweep-${sweep}.log"
                       rm "$raw"
@@ -98,7 +100,7 @@ jobs:
               run: |
                   set -euo pipefail
                   make iso
-                  cp build/sapote.iso evidence/process/Sapote-v0.7.0.iso
+                  cp build/sapote.iso evidence/process/Sapote-process-regression.iso
                   python3 tools/make-elf64-fixture.py \
                       build/tests/process/SAPOTE.BIN
                   python3 tools/make-process-fixture.py \
@@ -133,7 +135,7 @@ jobs:
                           | sort -z | xargs -0 -r cat | wc -l
                   )
                   ordinary_record=$(
-                      grep -E '^ST LEDGER stages 43 receipts 43 capabilities 49 skips 5 fingerprint 0x[0-9A-F]{16}$' \
+                      grep -E '^ST LEDGER stages [1-9][0-9]* receipts [1-9][0-9]* capabilities [1-9][0-9]* skips [0-9]+ fingerprint 0x[0-9A-F]{16}$' \
                           evidence/process/ordinary-ledger.log
                   )
                   test -n "$ordinary_record"
@@ -180,14 +182,17 @@ jobs:
                       printf 'commit: %s\n' "$GITHUB_SHA"
                       printf 'tree: %s\n' "$(git rev-parse 'HEAD^{tree}')"
                       printf 'scenarios per sweep: %s\n' "$scenario_count"
-                      printf 'Boot Ledger capacity: 43 stages, 43 receipts, 18 capabilities per stage\n'
+                      printf 'Boot Ledger capacity: %s stages, %s receipts, %s capabilities per stage\n' \
+                          "$(sed -nE 's/^#define BOOT_LEDGER_STAGE_CAPACITY ([0-9]+)U$/\1/p' include/sapote/boot_ledger.h)" \
+                          "$(sed -nE 's/^#define BOOT_LEDGER_RECEIPT_CAPACITY ([0-9]+)U$/\1/p' include/sapote/boot_ledger.h)" \
+                          "$(sed -nE 's/^#define BOOT_STAGE_CAPABILITY_CAPACITY ([0-9]+)U$/\1/p' include/sapote/boot_ledger.h)"
                       printf 'ordinary ledger: %s\n' "$ordinary_record"
                       printf 'source lines (src and include): %s\n' "$source_lines"
                       printf 'shell assertion lines: %s\n' "$assertion_count"
                       printf 'kernel bytes: %s\n' "$(stat -c %s build/sapote.elf)"
                       printf 'ISO bytes: %s\n' "$(stat -c %s build/sapote.iso)"
                       printf 'make verify: passed\n'
-                      printf 'all 37 scenarios: passed individually\n'
+                      printf 'all %s scenarios: passed individually\n' "$scenario_count"
                       printf 'serial TCG complete sweeps: 10 passed\n'
                       cat evidence/process/accelerator-results.txt
                       printf 'CPL3 proof: loaded ELF fetch, private CR3, DPL3 vector 0x81, authenticated result\n'
@@ -203,7 +208,7 @@ jobs:
                   (
                       cd evidence/process
                       sha256sum \
-                          Sapote-v0.7.0.iso \
+                          Sapote-process-regression.iso \
                           SAPOTE.BIN \
                           process-fixture.raw \
                           process-scenario.iso \

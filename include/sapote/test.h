@@ -49,6 +49,7 @@ enum kernel_test_scenario {
     KERNEL_TEST_NVME,
     KERNEL_TEST_FILESYSTEM,
     KERNEL_TEST_PROCESS,
+    KERNEL_TEST_LINUX_ABI,
     KERNEL_TEST_INVALID
 };
 
@@ -87,6 +88,8 @@ _Noreturn void kernel_test_complete_filesystem(void);
 bool kernel_test_filesystem_exit_self_test(void);
 _Noreturn void kernel_test_complete_process(void);
 bool kernel_test_process_exit_self_test(void);
+_Noreturn void kernel_test_complete_linux_abi(void);
+bool kernel_test_linux_abi_exit_self_test(void);
 bool kernel_test_handle_fatal_interrupt(const struct interrupt_frame *frame);
 const char *kernel_test_scenario_name(enum kernel_test_scenario scenario);
 _Noreturn void kernel_test_fail(const char *reason);

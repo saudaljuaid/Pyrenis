@@ -2567,7 +2567,7 @@ enum nvme_status nvme_filesystem_session_read(
             NVME_STATUS_BLOCK_NOT_CPU_OWNED :
             NVME_STATUS_TRANSITION_INVALID;
     }
-    if (ordinal == 0U || ordinal > 4U ||
+    if (ordinal == 0U || ordinal > NVME_FILESYSTEM_READ_LIMIT ||
         ordinal != session->read_count + 1U) {
         return NVME_STATUS_READ_ORDINAL;
     }

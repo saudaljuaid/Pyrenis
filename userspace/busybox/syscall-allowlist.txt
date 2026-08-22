@@ -1,0 +1,27 @@
+# Sapote v0.8.0 BusyBox echo syscall contract
+#
+# This is a normalized trace of the exact binary identified below.  Addresses
+# whose host values vary are expressed by their Sapote fixture meaning.  The
+# preceding host execve installs the image and is not part of the in-kernel
+# allowlist.
+#
+# BusyBox SHA-256:
+# B308F2CAD5B5CD0EEB92A622DEC8D71C1A08F628A22CDC5BCDE2B98B53220746
+# argv: busybox echo SAPOTE
+# envp: empty
+# auxv: AT_PAGESZ=4096, AT_NULL
+
+01  158  arch_prctl(ARCH_SET_FS, 0x400001008998) = 0
+02  218  set_tid_address(0x400001008b34) = positive-proof-tid
+03   12  brk(NULL) = heap-base
+04   12  brk(heap-base + 8192) = heap-base + 8192
+05    9  mmap(heap-base, 4096, PROT_NONE,
+              MAP_PRIVATE|MAP_FIXED|MAP_ANONYMOUS, -1, 0) = heap-base
+06    9  mmap(NULL, 4096, PROT_READ|PROT_WRITE,
+              MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = anonymous-page
+07    1  write(1, "SAPOTE\n", 7) = 7
+08   11  munmap(anonymous-page, 4096) = 0
+09  231  exit_group(0) = no-return
+
+# Allowlist: 1, 9, 11, 12, 158, 218, 231 (7 distinct numbers).
+# Every other number returns -ENOSYS and leaves process state unchanged.

@@ -16,7 +16,10 @@ The C path advances through `unopened`, `session-ready`,
 `block-controller-owned`, `block-CPU-owned`, `volume-validated`,
 `file-located`, `file-read`, `stopping` and `released`. Repeated, reversed,
 skipped and cross-generation transitions return named failures. The private
-NVMe session permits one live instance and ordinals 1–4 only.
+The private NVMe session permits one live instance and ordinals 1–12 only.
+The inherited `filesystem` and `process` consumers still stop after ordinal 4;
+the Linux ABI consumer alone uses ordinals 5–12 for its remaining eight
+BusyBox data clusters.
 
 The controller is initialized once. It identifies active namespace 1 and
 validates 4096 logical blocks of 4096 bytes before opening the session. The
